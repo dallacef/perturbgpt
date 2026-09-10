@@ -1,0 +1,1 @@
+# GitHub Actions workflow: lint (ruff) and run the pytest suite on every push/PR.

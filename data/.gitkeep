@@ -1,0 +1,1 @@
+Placeholder so the (gitignored) data directory exists; populated at runtime by scripts/download_data.py.

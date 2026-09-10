@@ -1,0 +1,1 @@
+Package metadata and pinned dependencies (PyTorch, scanpy/anndata, faiss-cpu, fastapi, pytest, etc.); installed in editable mode for development.
