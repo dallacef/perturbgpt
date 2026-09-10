@@ -1,1 +1,35 @@
-# Dataset accession/source, download date, and preprocessing parameters (QC thresholds, normalization, HVG count).
+dataset:
+  name: Norman et al. 2019 Perturb-seq (K562 transcription-factor overexpression)
+  accession: GSE133344
+  source: scPerturb harmonized mirror (Zenodo record 7041849)
+  source_url: https://zenodo.org/records/7041849/files/NormanWeissman2019_filtered.h5ad?download=1
+  source_record: https://doi.org/10.5281/zenodo.7041849
+  license: CC-BY-4.0
+  citation: Norman et al., Science 2019, doi:10.1126/science.aax4438; harmonized by
+    scPerturb (Peidli et al., doi:10.1101/2022.08.20.504663)
+  download_date: '2026-09-10'
+  md5: c870e6967d91c017d9da827bab183cd6
+  raw_file: data/raw/NormanWeissman2019_filtered.h5ad
+  guide_identities_url: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE133nnn/GSE133344/suppl/GSE133344_filtered_cell_identities.csv.gz
+  guide_identities_file: data/raw/GSE133344_filtered_cell_identities.csv.gz
+  processed_file: data/processed/perturbseq.h5ad
+schema:
+  perturbation_col: perturbation
+  guide_id_col: guide_id
+  n_genes_col: ngenes
+  n_counts_col: ncounts
+  mito_pct_col: percent_mito
+  required_obs_columns:
+  - perturbation
+  - guide_id
+  - ncounts
+  - ngenes
+  - percent_mito
+preprocessing:
+  min_genes_per_cell: 1000
+  max_mito_pct: 15.0
+  doublet_column: number_of_cells
+  require_good_coverage: true
+  good_coverage_column: good_coverage
+  target_sum: 10000.0
+  n_top_hvgs: 2000

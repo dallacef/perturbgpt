@@ -1,1 +1,27 @@
-Package metadata and pinned dependencies (PyTorch, scanpy/anndata, faiss-cpu, fastapi, pytest, etc.); installed in editable mode for development.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perturbatlas"
+version = "0.1.0"
+description = "PerturbGPT: perturbation-response modeling on Perturb-seq data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anndata>=0.10",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
