@@ -22,3 +22,6 @@ __pycache__/
 # OS
 .DS_Store
 
+# W&B local offline runs
+wandb/
+

@@ -1,0 +1,30 @@
+# W&B sweep configuration for baseline hyperparameter tuning.
+# Launch with: python scripts/run_sweep.py --count 20
+# Or manually: wandb sweep configs/sweep_baseline.yaml
+
+program: scripts/train_baseline.py
+method: bayes
+metric:
+  name: val_pearson
+  goal: maximize
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1.0e-2
+  embed_dim:
+    values: [32, 64, 128]
+  hidden_dim:
+    values: [64, 128, 256]
+  num_layers:
+    distribution: int_uniform
+    min: 1
+    max: 3
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.3
+  pca_variance:
+    distribution: uniform
+    min: 0.90
+    max: 0.99

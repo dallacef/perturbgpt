@@ -20,6 +20,12 @@ import torch
 import torch.nn as nn
 import yaml
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
@@ -125,6 +131,9 @@ def main(argv=None) -> int:
     parser.add_argument("--results", default=str(PROJECT_ROOT / "results" / "metrics.csv"))
     parser.add_argument("--epochs", type=int, default=None, help="override config epochs")
     parser.add_argument("--seed", type=int, default=None, help="override config seed")
+    parser.add_argument("--use-wandb", action="store_true", help="enable W&B tracking")
+    parser.add_argument("--wandb-project", default=None, help="W&B project name")
+    parser.add_argument("--wandb-run-name", default=None, help="W&B run name")
     args = parser.parse_args(argv)
 
     model_cfg = load_config(Path(args.model_config))["baseline"]
@@ -135,6 +144,48 @@ def main(argv=None) -> int:
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- W&B initialization ---
+    wandb_cfg = train_cfg.get("wandb", {})
+    use_wandb = args.use_wandb or wandb_cfg.get("enabled", False)
+    wandb_run = None
+    if use_wandb:
+        if not _WANDB_AVAILABLE:
+            print("WARNING: --use-wandb requested but wandb not installed; skipping.")
+            use_wandb = False
+        else:
+            run_config = {
+                "seed": seed,
+                "pca_variance": model_cfg.get("pca_variance"),
+                "pca_components": model_cfg.get("pca_components"),
+                "embed_dim": model_cfg["embed_dim"],
+                "hidden_dim": model_cfg["hidden_dim"],
+                "num_layers": model_cfg["num_layers"],
+                "dropout": model_cfg["dropout"],
+                "lr": model_cfg["lr"],
+                "epochs": args.epochs or model_cfg["epochs"],
+                "patience": model_cfg.get("patience", 10),
+                "top_k": model_cfg.get("top_k", 50),
+                "split_seed": seed,
+                "train_frac": train_cfg["splitting"]["perturbation_split"]["train_frac"],
+                "val_frac": train_cfg["splitting"]["perturbation_split"]["val_frac"],
+                "test_frac": train_cfg["splitting"]["perturbation_split"]["test_frac"],
+            }
+            wandb_run = wandb.init(
+                project=args.wandb_project or wandb_cfg.get("project", "perturbgpt-baseline"),
+                entity=wandb_cfg.get("entity"),
+                name=args.wandb_run_name or wandb_cfg.get("run_name"),
+                tags=wandb_cfg.get("tags", ["baseline"]),
+                config=run_config,
+            )
+            # Sweep agent overrides: wandb.config may contain hyperparameters
+            # injected by the sweep controller. These take precedence.
+            for key in ("lr", "embed_dim", "hidden_dim", "num_layers", "dropout", "pca_variance"):
+                if key in wandb.config:
+                    model_cfg[key] = wandb.config[key]
+                    print(f"  sweep override: {key} = {wandb.config[key]}")
+            if "epochs" in wandb.config:
+                args.epochs = wandb.config["epochs"]
 
     # 1. Load processed data
     processed_path = PROJECT_ROOT / data_cfg["dataset"]["processed_file"]
@@ -161,6 +212,9 @@ def main(argv=None) -> int:
     pca = fit_pca_on_control(adata, split, variance=variance, n_components=n_comp)
     pca_dim = pca.n_components_
     print(f"PCA: {pca_dim} components (variance threshold={variance})")
+    if use_wandb:
+        wandb.log({"pca_dim": pca_dim, "num_train_perts": len(split.train_perts),
+                    "num_val_perts": len(split.val_perts), "num_test_perts": len(split.test_perts)})
 
     # PCA-project the control mean expression
     perts_col = adata.obs["perturbation"].astype(str)
@@ -213,6 +267,23 @@ def main(argv=None) -> int:
     patience_counter = 0
     patience = model_cfg.get("patience", 10)
     top_k = model_cfg.get("top_k", 50)
+    log_interval = wandb_cfg.get("log_interval", 1)
+    full_val_interval = wandb_cfg.get("full_val_interval", 5)
+
+    # Precompute val tensors for efficient per-epoch evaluation
+    val_perts_sorted = sorted(val_deltas.keys()) if val_deltas else []
+    val_pca_feat = torch.tensor(
+        np.tile(pca_ctrl_mean[np.newaxis, :], (len(val_perts_sorted), 1)),
+        dtype=torch.float32, device=device,
+    ) if val_perts_sorted else None
+    val_indices = torch.tensor(
+        [pert_to_idx.get(p, UNKNOWN_IDX) for p in val_perts_sorted],
+        dtype=torch.long, device=device,
+    ) if val_perts_sorted else None
+    val_targets = torch.tensor(
+        np.stack([val_deltas[p] for p in val_perts_sorted]),
+        dtype=torch.float32, device=device,
+    ) if val_perts_sorted else None
 
     for epoch in range(epochs):
         model.train()
@@ -222,36 +293,48 @@ def main(argv=None) -> int:
         loss.backward()
         optimizer.step()
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            model.eval()
-            val_loss = float("inf")
-            if val_deltas:
-                val_perts_sorted = sorted(val_deltas.keys())
-                with torch.no_grad():
-                    vp = model(
-                        torch.tensor(
-                            np.tile(pca_ctrl_mean[np.newaxis, :], (len(val_perts_sorted), 1)),
-                            dtype=torch.float32, device=device,
-                        ),
-                        torch.tensor(
-                            [pert_to_idx.get(p, UNKNOWN_IDX) for p in val_perts_sorted],
-                            dtype=torch.long, device=device,
-                        ),
-                    )
-                    val_loss = float(loss_fn(vp, torch.tensor(
-                        np.stack([val_deltas[p] for p in val_perts_sorted]),
-                        dtype=torch.float32, device=device,
-                    )))
+        # Evaluate val loss every epoch (cheap — ~15 perturbations)
+        model.eval()
+        val_loss = float("inf")
+        if val_perts_sorted:
+            with torch.no_grad():
+                vp = model(val_pca_feat, val_indices)
+                val_loss = float(loss_fn(vp, val_targets))
+
+        # Print + log to wandb at log_interval or first epoch
+        if (epoch + 1) % log_interval == 0 or epoch == 0:
             print(f"Epoch {epoch+1:3d}/{epochs}  train_loss={loss.item():.6f}  val_loss={val_loss:.6f}")
-            if model_cfg.get("early_stopping", True) and val_loss < float("inf"):
-                if val_loss < best_val_loss - 1e-6:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f"Early stopping at epoch {epoch+1}")
-                        break
+            if use_wandb:
+                wandb.log({"epoch": epoch + 1, "train_loss": loss.item(), "val_loss": val_loss})
+
+        # Full val metrics (pearson, spearman, mse, mae, top-k) every full_val_interval
+        if val_perts_sorted and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
+            with torch.no_grad():
+                val_preds_np = model(val_pca_feat, val_indices).cpu().numpy()
+            val_trues_np = np.stack([val_deltas[p] for p in val_perts_sorted])
+            val_metrics = {
+                "val/pearson": pearson_corr(val_preds_np, val_trues_np),
+                "val/spearman": spearman_corr(val_preds_np, val_trues_np),
+                "val/mse": mse(val_preds_np, val_trues_np),
+                "val/mae": mae(val_preds_np, val_trues_np),
+            }
+            tk = top_k_recovery(val_preds_np, val_trues_np, k=top_k)
+            val_metrics[f"val/top{top_k}_precision"] = tk["precision"]
+            val_metrics[f"val/top{top_k}_recall"] = tk["recall"]
+            val_metrics["epoch"] = epoch + 1
+            if use_wandb:
+                wandb.log(val_metrics)
+
+        # Early stopping
+        if model_cfg.get("early_stopping", True) and val_loss < float("inf"):
+            if val_loss < best_val_loss - 1e-6:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
 
     # 7. Evaluate on val and test
     results_path = Path(args.results)
@@ -264,8 +347,17 @@ def main(argv=None) -> int:
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
         append_results(results_path, "baseline", split_name, metrics)
+        # Log final summary metrics to wandb (no epoch step — these are final)
+        if use_wandb:
+            summary_metrics = {f"{split_name}_{k}": v for k, v in metrics.items()}
+            for k, v in summary_metrics.items():
+                wandb.run.summary[k] = v
+            # Also log as a final step for the charts
+            wandb.log({f"final/{split_name}/{k}": v for k, v in metrics.items()})
 
     print(f"\nResults appended to {results_path}")
+    if use_wandb:
+        wandb.finish()
     return 0
 
 
