@@ -147,7 +147,10 @@ def main(argv=None) -> int:
 
     # --- W&B initialization ---
     wandb_cfg = train_cfg.get("wandb", {})
-    use_wandb = args.use_wandb or wandb_cfg.get("enabled", False)
+    # Auto-enable wandb when running under a sweep agent (env var is set by wandb)
+    import os
+    _under_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+    use_wandb = args.use_wandb or wandb_cfg.get("enabled", False) or _under_sweep
     wandb_run = None
     if use_wandb:
         if not _WANDB_AVAILABLE:
