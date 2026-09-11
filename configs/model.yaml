@@ -1,1 +1,25 @@
-# Architecture hyperparameters for the baseline and prediction-head models (hidden sizes, embedding dims, dropout).
+# Architecture hyperparameters for the baseline and prediction-head models.
+
+baseline:
+  # PCA is fit on train-split control cells; the number of components is
+  # automatically chosen as the minimum that explains this fraction of
+  # variance (0.95 = 95%). Set to null to use a fixed pca_components instead.
+  pca_variance: 0.95
+  pca_components: null      # used only when pca_variance is null
+  embed_dim: 64
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.1
+  lr: 1.0e-3
+  epochs: 100
+  batch_size: 32
+  early_stopping: true
+  patience: 10
+  top_k: 50
+
+prediction_head:
+  hidden_dim: 256
+  num_layers: 3
+  dropout: 0.2
+  lr: 1.0e-4
+
