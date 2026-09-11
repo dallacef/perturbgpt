@@ -12,7 +12,7 @@ import pytest
 from anndata import AnnData
 from scipy import sparse
 
-from perturbatlas.data import preprocessing as pp
+from perturbgpt.data import preprocessing as pp
 
 GENE_NAMES = ["MT-ND1", "MT-ND2"] + [f"GENE{i}" for i in range(2, 10)]
 

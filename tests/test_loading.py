@@ -8,7 +8,7 @@ import pytest
 import yaml
 from anndata import AnnData
 
-from perturbatlas.data.loading import (
+from perturbgpt.data.loading import (
     SchemaValidationError,
     load_dataset,
     load_h5ad,

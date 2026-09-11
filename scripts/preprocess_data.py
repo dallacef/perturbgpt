@@ -21,8 +21,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import numpy as np  # noqa: E402
 
-from perturbatlas.data import preprocessing as pp  # noqa: E402
-from perturbatlas.data.loading import load_config, load_dataset  # noqa: E402
+from perturbgpt.data import preprocessing as pp  # noqa: E402
+from perturbgpt.data.loading import load_config, load_dataset  # noqa: E402
 
 
 def main(argv=None) -> int:
