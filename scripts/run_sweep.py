@@ -66,7 +66,7 @@ def main(argv=None) -> int:
     print(f"Sweep created successfully!")
     print(f"  Sweep ID:  {sweep_id}")
     print(f"  Project:   {args.project}")
-    entity_str = args.entity or wandb.api.default_entity
+    entity_str = args.entity or wandb.Api().default_entity
     print(f"  Entity:    {entity_str}")
     print(f"  Dashboard: https://wandb.ai/{entity_str}/{args.project}/sweeps/{sweep_id}")
 

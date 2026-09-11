@@ -120,6 +120,66 @@ def append_results(
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def parse_hparam_overrides(unknown_args: list[str], model_cfg: dict) -> dict:
+    """Parse ``--key=value`` / ``--key value`` flags injected by the wandb
+    agent (or typed manually) into a dict of hyperparameter overrides.
+
+    Types are coerced to match the existing value in ``model_cfg`` when the
+    key is known; otherwise we try int, then float, then keep the string.
+    Unknown keys (not present in ``model_cfg``) are still returned so the
+    caller can decide what to do with them.
+    """
+    overrides: dict[str, object] = {}
+    i = 0
+    while i < len(unknown_args):
+        tok = unknown_args[i]
+        if not tok.startswith("--"):
+            i += 1
+            continue
+        body = tok[2:]
+        if "=" in body:
+            key, raw = body.split("=", 1)
+        else:
+            # value is the next token (unless it's another flag)
+            if i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith("--"):
+                key, raw = body, unknown_args[i + 1]
+                i += 1
+            else:
+                # bare boolean flag
+                key, raw = body, "true"
+        key = key.strip()
+        raw = raw.strip()
+
+        def coerce(val: str):
+            existing = model_cfg.get(key)
+            if isinstance(existing, bool):
+                return val.lower() in ("1", "true", "yes", "on")
+            if isinstance(existing, int):
+                return int(val)
+            if isinstance(existing, float):
+                return float(val)
+            # not in config → infer
+            try:
+                return int(val)
+            except ValueError:
+                pass
+            try:
+                return float(val)
+            except ValueError:
+                return val
+
+        overrides[key] = coerce(raw)
+        i += 1
+    return overrides
+
+
+
 
 
 
@@ -134,11 +194,20 @@ def main(argv=None) -> int:
     parser.add_argument("--use-wandb", action="store_true", help="enable W&B tracking")
     parser.add_argument("--wandb-project", default=None, help="W&B project name")
     parser.add_argument("--wandb-run-name", default=None, help="W&B run name")
-    args = parser.parse_args(argv)
+    # Use parse_known_args: the wandb agent injects sampled hyperparameters as
+    # extra --key=value flags, which argparse would otherwise reject.
+    args, unknown = parser.parse_known_args(argv)
 
     model_cfg = load_config(Path(args.model_config))["baseline"]
     train_cfg = load_config(Path(args.training_config))
     data_cfg = load_config(Path(args.data_config))
+
+    # Apply sweep/CLI hyperparameter overrides (highest precedence).
+    hparam_overrides = parse_hparam_overrides(unknown, model_cfg)
+    for key, value in hparam_overrides.items():
+        old = model_cfg.get(key)
+        model_cfg[key] = value
+        print(f"  override: {key} = {value}  (was {old!r})")
 
     seed = args.seed if args.seed is not None else train_cfg["splitting"]["seed"]
     torch.manual_seed(seed)
