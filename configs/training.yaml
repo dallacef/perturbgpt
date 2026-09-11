@@ -1,1 +1,28 @@
-# Training hyperparameters: optimizer, learning rate schedule, batch size, split random seed, early-stopping criteria.
+# Training hyperparameters: optimizer, learning rate schedule, batch size,
+# split random seed, early-stopping criteria.
+
+splitting:
+  seed: 42
+  perturbation_split:
+    train_frac: 0.70
+    val_frac: 0.15
+    test_frac: 0.15
+    control_split: "train"       # which split receives control cells
+  combinatorial_split:
+    combo_train_frac: 0.50       # fraction of 2-gene combos kept in training
+  persist_dir: "data/processed/splits"
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+
+schedule:
+  warmup_steps: 500
+
+batch_size: 64
+
+early_stopping:
+  patience: 10
+  min_delta: 1.0e-4
+

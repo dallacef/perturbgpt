@@ -85,5 +85,3 @@ def load_dataset(config_path: Union[str, Path]) -> ad.AnnData:
     required = config.get("schema", {}).get("required_obs_columns", [])
     validate_obs_schema(adata, required)
     return adata
-
-pass
