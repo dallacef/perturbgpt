@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 wandb = ["wandb>=0.16"]
+retrieval = ["faiss-cpu>=1.7"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
