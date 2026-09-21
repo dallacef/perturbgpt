@@ -169,6 +169,26 @@ def test_normalize_total_log1p_preserves_counts_layer(norm_adata):
     assert out.obs["total_counts"].tolist() == [10.0, 10.0, 0.0, 5.0]
 
 
+def test_normalize_total_log1p_no_log_transform(norm_adata):
+    out = pp.normalize_total_log1p(norm_adata, target_sum=1e4, log1p=False)
+    X = out.X.toarray() if sparse.issparse(out.X) else np.asarray(out.X)
+    assert np.all(X >= 0)
+    assert not np.isnan(X).any()
+    # values are raw scaled counts (no log), saturating at target_sum
+    assert X[0, 0] == pytest.approx(1e4, rel=1e-6)
+    assert X.max() <= 1e4 + 1e-6
+    # row sums recover the target library size for non-empty cells
+    row_sums = X.sum(axis=1)
+    assert row_sums[0] == pytest.approx(1e4, rel=1e-4)
+    assert row_sums[1] == pytest.approx(1e4, rel=1e-4)
+    assert row_sums[3] == pytest.approx(1e4, rel=1e-4)
+    assert row_sums[2] == 0.0  # empty cell stays zero
+    # counts layer still holds the untouched raw counts
+    counts = out.layers["counts"]
+    counts = counts.toarray() if sparse.issparse(counts) else np.asarray(counts)
+    np.testing.assert_array_equal(counts, norm_adata.X)
+
+
 # ---------------------------------------------------------------------- HVGs
 
 

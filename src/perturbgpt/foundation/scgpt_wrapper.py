@@ -202,6 +202,7 @@ class ScGPTWrapper:
         """
         from scgpt.preprocess import Preprocessor
 
+        print(adata.X.toarray().sum(1).min())
         preprocessor = Preprocessor(
             use_key=None,
             filter_gene_by_counts=False,
@@ -212,7 +213,7 @@ class ScGPTWrapper:
             result_log1p_key="X_log1p",
             subset_hvg=self.n_hvg,
             hvg_use_key=None,
-            hvg_flavor="seurat_v3",
+            hvg_flavor="seurat",
             binning=self.n_bins,
             result_binned_key="X_binned",
         )

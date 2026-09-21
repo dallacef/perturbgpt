@@ -33,4 +33,5 @@ preprocessing:
   require_good_coverage: true
   good_coverage_column: good_coverage
   target_sum: 10000.0
-  n_top_hvgs: 2000
+  log1p: false
+  n_top_hvgs: 3000

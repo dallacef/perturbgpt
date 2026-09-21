@@ -67,8 +67,11 @@ def main(argv=None) -> int:
     adata = pp.filter_doublets(adata, column=cfg.get("doublet_column"))
     counts.append((f"doublet removal ({cfg.get('doublet_column') or 'auto'})", adata.n_obs))
 
-    adata = pp.normalize_total_log1p(adata, target_sum=float(cfg["target_sum"]))
-    counts.append(("normalize + log1p", adata.n_obs))
+    log1p = bool(cfg.get("log1p", True))
+    adata = pp.normalize_total_log1p(
+        adata, target_sum=float(cfg["target_sum"]), log1p=log1p
+    )
+    counts.append(("normalize + log1p" if log1p else "normalize (no log1p)", adata.n_obs))
 
     adata = pp.select_highly_variable_genes(adata, n_top_genes=int(cfg["n_top_hvgs"]))
 

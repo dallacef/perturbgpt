@@ -143,13 +143,17 @@ def filter_doublets(adata: ad.AnnData, column: Optional[str] = None) -> ad.AnnDa
 
 
 def normalize_total_log1p(
-    adata: ad.AnnData, target_sum: float = 1e4, counts_layer: str = "counts"
+    adata: ad.AnnData,
+    target_sum: float = 1e4,
+    counts_layer: str = "counts",
+    log1p: bool = True,
 ) -> ad.AnnData:
     """Library-size normalize to ``target_sum`` counts per cell, then log1p.
 
     Raw counts are preserved in ``.layers[counts_layer]`` and each cell's
-    original library size in ``.obs['total_counts']``. Returned values lie in
-    ``[0, log1p(target_sum)]``; cells with zero counts stay all-zero.
+    original library size in ``.obs['total_counts']``. When ``log1p`` is True,
+    returned values lie in ``[0, log1p(target_sum)]``; otherwise they lie in
+    ``[0, target_sum]``. Cells with zero counts stay all-zero either way.
     """
     out = adata.copy()
     X = _as_csr_float32(out.X)
@@ -162,7 +166,8 @@ def normalize_total_log1p(
         where=totals > 0,
     )
     X = X.multiply(scale[:, None]).tocsr()
-    X.data = np.log1p(X.data)
+    if log1p:
+        X.data = np.log1p(X.data)
     out.X = X
     out.obs["total_counts"] = totals
     return out
