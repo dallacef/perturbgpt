@@ -75,6 +75,20 @@ def test_filter_min_genes_uses_precomputed_column(adata):
     assert "cell7" not in out.obs_names
 
 
+def test_filter_min_counts_removes_expected_cells(adata):
+    out = pp.filter_min_counts(adata, min_counts=10)
+    assert out.n_obs == 7
+    assert "cell5" not in out.obs_names
+
+
+def test_filter_min_counts_uses_precomputed_column(adata):
+    # values in the named column take precedence over recomputation
+    adata.obs["total_counts"] = [50, 50, 50, 50, 50, 50, 50, 1]
+    out = pp.filter_min_counts(adata, min_counts=10, n_counts_col="total_counts")
+    assert out.n_obs == 7
+    assert "cell7" not in out.obs_names
+
+
 def test_filter_mito_fraction_removes_expected_cells(adata):
     out = pp.filter_mito_fraction(adata, max_mito_pct=15.0)
     assert out.n_obs == 7
@@ -102,7 +116,8 @@ def test_filter_doublets_no_column_is_noop(adata):
 
 
 def test_qc_filters_chain_to_expected_cells(adata):
-    out = pp.filter_min_genes(adata, min_genes=5)
+    out = pp.filter_min_counts(adata, min_counts=10)
+    out = pp.filter_min_genes(out, min_genes=5)
     out = pp.filter_mito_fraction(out, max_mito_pct=15.0)
     out = pp.filter_doublets(out)
     assert list(out.obs_names) == [f"cell{i}" for i in range(5)]

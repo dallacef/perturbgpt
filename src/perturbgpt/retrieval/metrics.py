@@ -23,19 +23,25 @@ from perturbgpt.data.splitting import parse_perturbation
 def get_pathway_memberships() -> dict[str, set[str]]:
     """Return a mapping gene_symbol → set of pathway/gene-set names.
 
-    .. note::
+    Loads the MSigDB Hallmark gene sets via
+    :func:`~perturbgpt.eval.pathway_metrics.load_gene_sets` and inverts
+    the mapping (pathway → genes) into (gene → pathways).
 
-       **Stub implementation.**  Returns an empty dict so that all
-       co-membership ground-truth sets are empty and all metrics evaluate
-       to 0.0.  Prompt 7 will replace this with a real curated pathway
-       lookup (MSigDB C2/Reactome/KEGG).
-
-    Returns
-    -------
-    dict[str, set[str]]
-        Gene symbol → pathway names.  Empty in the stub.
+    If the gene-set file is not available (gseapy not installed, no local
+    cache), returns an empty dict so downstream code degrades gracefully
+    rather than crashing.
     """
-    return {}
+    try:
+        from perturbgpt.eval.pathway_metrics import load_gene_sets
+        gene_sets = load_gene_sets()
+    except (ImportError, FileNotFoundError, OSError):
+        return {}
+
+    memberships: dict[str, set[str]] = {}
+    for pathway, genes in gene_sets.items():
+        for g in genes:
+            memberships.setdefault(g, set()).add(pathway)
+    return memberships
 
 
 # --------------------------------------------------------- ground-truth build

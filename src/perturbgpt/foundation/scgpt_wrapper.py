@@ -105,7 +105,8 @@ class ScGPTWrapper:
         import torch
         from scgpt.model import TransformerModel
         from scgpt.tokenizer.gene_tokenizer import GeneVocab
-        from scgpt.utils import set_seed
+        from scgpt.utils import set_seed, load_pretrained
+
 
         set_seed(seed)
 
@@ -137,33 +138,35 @@ class ScGPTWrapper:
         self.model = TransformerModel(
             ntoken=len(self.vocab),
             d_model=model_args.get("embsize", 512),
-            nhead=model_args.get("nhead", 8),
+            nhead=model_args.get("nheads", 8),
             d_hid=model_args.get("d_hid", 512),
             nlayers=model_args.get("nlayers", 12),
             nlayers_cls=model_args.get("n_layers_cls", 3),
-            n_cls=1,
+            # n_cls=1,
             vocab=self.vocab,
-            dropout=0.0,
+            dropout=model_args.get("dropout", 0.0),
             pad_token=PAD_TOKEN,
             pad_value=PAD_VALUE,
-            do_mvc=False,
+            do_mvc=model_args.get("MVC", False),
             do_dab=False,
             use_batch_labels=False,
             domain_spec_batchnorm=False,
-            input_emb_style="continuous",
-            n_input_bins=n_bins,
+            input_emb_style=model_args.get("input_emb_style", 'continuous'),
+            n_input_bins=model_args.get("n_bins", 51),
             cell_emb_style="cls",
-            mvc_decoder_style="inner product",
+            # mvc_decoder_style="inner product",
             ecs_threshold=0.0,
             explicit_zero_prob=False,
-            use_fast_transformer=False,
+            use_fast_transformer=True,
+            # use_fast_transformer=False,
             pre_norm=False,
         )
 
         # Load pretrained weights
         ckpt_path = model_dir / "best_model.pt"
-        state_dict = torch.load(ckpt_path, map_location="cpu")
-        self.model.load_state_dict(state_dict)
+        # state_dict = torch.load(ckpt_path, map_location="cpu")
+        # self.model.load_state_dict(state_dict)
+        load_pretrained(self.model, torch.load(ckpt_path, map_location='cpu'), verbose=False)
         logger.info("Loaded checkpoint from %s", ckpt_path)
 
         # Freeze
@@ -213,7 +216,8 @@ class ScGPTWrapper:
             binning=self.n_bins,
             result_binned_key="X_binned",
         )
-        adata_pp = preprocessor(adata.copy(), batch_key=None)
+        adata_pp = adata.copy()
+        preprocessor(adata_pp)
         return adata_pp
 
     def _match_vocabulary(
@@ -231,6 +235,7 @@ class ScGPTWrapper:
         """
         vocab = self.vocab
         var_names = list(adata.var_names)
+        # var_names = adata.var['gene_name']
         matched = []
         indices = []
         for idx, gene in enumerate(var_names):
@@ -325,7 +330,7 @@ class ScGPTWrapper:
                 )
 
                 # cell_emb_style == "cls" -> the CLS token is the cell emb
-                cell_emb = output[:, 0, :]  # [batch, d_model]
+                cell_emb = output["cell_emb"]  # [batch, d_model]
                 embeddings[start:end] = cell_emb.cpu().numpy().astype(np.float32)
 
         return embeddings

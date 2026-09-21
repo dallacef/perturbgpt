@@ -26,6 +26,7 @@ schema:
   - ngenes
   - percent_mito
 preprocessing:
+  min_counts_per_cell: 1000
   min_genes_per_cell: 1000
   max_mito_pct: 15.0
   doublet_column: number_of_cells

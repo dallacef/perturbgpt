@@ -49,6 +49,11 @@ def main(argv=None) -> int:
         adata = adata[keep].copy()
         counts.append((f"{cov_col} == True", adata.n_obs))
 
+    adata = pp.filter_min_counts(
+        adata, cfg["min_counts_per_cell"], n_counts_col=schema.get("n_counts_col", "ncounts")
+    )
+    counts.append((f"total counts >= {cfg['min_counts_per_cell']}", adata.n_obs))
+
     adata = pp.filter_min_genes(
         adata, cfg["min_genes_per_cell"], n_genes_col=schema.get("n_genes_col", "n_genes")
     )

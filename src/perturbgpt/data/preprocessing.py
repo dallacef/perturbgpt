@@ -65,6 +65,22 @@ def compute_qc_metrics(adata: ad.AnnData, mito_prefix: str = "MT-") -> ad.AnnDat
     return out
 
 
+def filter_min_counts(
+    adata: ad.AnnData, min_counts: int, n_counts_col: str = "total_counts"
+) -> ad.AnnData:
+    """Remove cells with fewer than ``min_counts`` total UMI counts.
+
+    Uses ``adata.obs[n_counts_col]`` if present, otherwise computes the
+    per-cell library size from ``.X``.
+    """
+    if n_counts_col in adata.obs.columns:
+        n_counts = adata.obs[n_counts_col].to_numpy()
+    else:
+        X = adata.X
+        n_counts = np.asarray(X.sum(axis=1)).ravel()
+    return adata[n_counts >= min_counts].copy()
+
+
 def filter_min_genes(
     adata: ad.AnnData, min_genes: int, n_genes_col: str = "n_genes"
 ) -> ad.AnnData:
