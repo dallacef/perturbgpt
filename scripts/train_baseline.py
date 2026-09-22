@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
+from scipy import sparse as sp
 
 try:
     import wandb
@@ -263,6 +264,16 @@ def main(argv=None) -> int:
     processed_path = PROJECT_ROOT / data_cfg["dataset"]["processed_file"]
     adata = ad.read_h5ad(processed_path)
     print(f"Loaded processed data: {adata.n_obs} cells x {adata.n_vars} genes")
+
+    # Apply log1p if the data was not log-transformed during preprocessing.
+    if not data_cfg["preprocessing"].get("log1p", True):
+        print("Applying log1p transformation (preprocessing.log1p was false)...")
+        if sp.issparse(adata.X):
+            adata.X = adata.X.copy()
+            adata.X.data = np.log1p(adata.X.data)
+        else:
+            adata.X = np.log1p(np.asarray(adata.X, dtype=np.float64))
+        print("  log1p applied to expression matrix")
 
     # 2. Build perturbation-level split
     ps_cfg = train_cfg["splitting"]["perturbation_split"]

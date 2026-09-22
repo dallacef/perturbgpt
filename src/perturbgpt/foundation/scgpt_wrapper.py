@@ -202,7 +202,7 @@ class ScGPTWrapper:
         """
         from scgpt.preprocess import Preprocessor
 
-        print(adata.X.toarray().sum(1).min())
+        print(adata.X.toarray()[0:5, 0:5])
         preprocessor = Preprocessor(
             use_key=None,
             filter_gene_by_counts=False,
@@ -213,13 +213,12 @@ class ScGPTWrapper:
             result_log1p_key="X_log1p",
             subset_hvg=self.n_hvg,
             hvg_use_key=None,
-            hvg_flavor="seurat",
+            hvg_flavor="seurat_v3",
             binning=self.n_bins,
             result_binned_key="X_binned",
         )
-        adata_pp = adata.copy()
-        preprocessor(adata_pp)
-        return adata_pp
+        preprocessor(adata)
+        return adata
 
     def _match_vocabulary(
         self, adata: ad.AnnData
