@@ -4,6 +4,15 @@
 Trains on train-split perturbations, evaluates on val/test using MSE, MAE,
 Pearson/Spearman correlation, and top-k gene recovery, then appends results
 to ``results/metrics.csv`` (one row per model/split/run).
+
+Usage
+-----
+    python scripts/train_baseline.py
+    python scripts/train_baseline.py \
+        --model-config configs/model.yaml \
+        --training-config configs/training.yaml \
+        --data-config configs/data.yaml \
+        --use-wandb
 """
 
 from __future__ import annotations

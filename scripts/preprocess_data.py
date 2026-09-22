@@ -7,6 +7,11 @@ doublet/multiplet removal), library-size normalization + log1p, and
 highly-variable-gene selection. Saves the processed AnnData to
 ``data/processed/perturbseq.h5ad`` and prints a QC summary report with cell
 counts before/after each filter and the perturbation label distribution.
+
+Usage
+-----
+    python scripts/preprocess_data.py
+    python scripts/preprocess_data.py --config configs/data.yaml
 """
 
 from __future__ import annotations

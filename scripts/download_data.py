@@ -17,6 +17,12 @@ GEO per-cell guide-identity CSV is also fetched for cross-referencing.
 Accession, source URL and download date are recorded in ``configs/data.yaml``.
 Re-running is safe: existing files with a matching MD5 are skipped unless
 ``--force`` is given.
+
+Usage
+-----
+    python scripts/download_data.py
+    python scripts/download_data.py --force
+    python scripts/download_data.py --config configs/data.yaml --skip-guide-annotations
 """
 
 from __future__ import annotations
