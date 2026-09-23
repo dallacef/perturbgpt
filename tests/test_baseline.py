@@ -1,9 +1,8 @@
-"""Unit tests for the PCA+MLP baseline model and prediction metrics.
+"""Unit tests for the perturbation-embedding baseline model and metrics.
 
 Tests cover:
 - BaselineModel forward-pass shape checks on dummy batches
 - Unknown embedding index behaviour
-- PCA fitting on control cells
 - Pseudobulk delta computation against a hand-computed example
 - Pert-to-index mapping
 - Each metric function (MSE, MAE, Pearson, Spearman, top-k) against
@@ -31,14 +30,12 @@ from perturbgpt.models.baseline import (
     BaselineModel,
     build_pert_to_idx,
     compute_pseudobulk_deltas,
-    fit_pca_on_control,
 )
 from perturbgpt.data.splitting import CONTROL_LABEL, PerturbationSplit
 
 # ============================================================== model tests
 
 N_HVGS = 20
-PCA_DIM = 5
 EMBED_DIM = 8
 HIDDEN_DIM = 16
 NUM_PERTS = 4
@@ -47,7 +44,6 @@ NUM_PERTS = 4
 @pytest.fixture
 def model():
     return BaselineModel(
-        pca_dim=PCA_DIM,
         embed_dim=EMBED_DIM,
         hidden_dim=HIDDEN_DIM,
         num_layers=2,
@@ -59,16 +55,14 @@ def model():
 
 def test_baseline_forward_shape(model):
     batch = 7
-    pca_feat = torch.randn(batch, PCA_DIM)
     pert_idx = torch.tensor([1, 2, 3, 0, 1, 2, 3])
-    out = model(pca_feat, pert_idx)
+    out = model(pert_idx)
     assert out.shape == (batch, N_HVGS)
 
 
 def test_baseline_forward_single_batch(model):
-    pca_feat = torch.randn(1, PCA_DIM)
     pert_idx = torch.tensor([2])
-    out = model(pca_feat, pert_idx)
+    out = model(pert_idx)
     assert out.shape == (1, N_HVGS)
 
 
@@ -78,26 +72,24 @@ def test_baseline_unknown_embedding_is_zero(model):
     assert torch.allclose(emb, torch.zeros_like(emb))
 
 
-def test_baseline_unknown_produces_same_output_for_same_pca(model):
-    """Two unknown-pert inputs with same PCA features must produce
-    identical outputs (since the unknown embedding is zero)."""
+def test_baseline_unknown_produces_same_output(model):
+    """Two unknown-pert inputs must produce identical outputs (since the
+    unknown embedding is zero)."""
     model.eval()
-    pca_feat = torch.randn(3, PCA_DIM)
     idx_known = torch.tensor([1, 1, 1])
     idx_unknown = torch.tensor([0, 0, 0])
     with torch.no_grad():
-        out_known = model(pca_feat, idx_known)
-        out_unknown = model(pca_feat, idx_unknown)
+        out_known = model(idx_known)
+        out_unknown = model(idx_unknown)
     assert not torch.allclose(out_known, out_unknown)
     with torch.no_grad():
-        out_u2 = model(pca_feat, torch.tensor([0, 0, 0]))
+        out_u2 = model(torch.tensor([0, 0, 0]))
     assert torch.allclose(out_unknown, out_u2)
 
 
 def test_baseline_output_finite(model):
-    pca_feat = torch.randn(10, PCA_DIM)
     pert_idx = torch.randint(0, NUM_PERTS + 1, (10,))
-    out = model(pca_feat, pert_idx)
+    out = model(pert_idx)
     assert torch.all(torch.isfinite(out))
 
 
@@ -106,7 +98,7 @@ def test_baseline_embedding_has_correct_size(model):
     assert model.embedding.embedding_dim == EMBED_DIM
 
 
-# --------------------------------------------------------- PCA / data tests
+# ------------------------------------------------------------- data tests
 
 
 def _make_split_adata() -> AnnData:
@@ -141,15 +133,6 @@ def _make_split() -> PerturbationSplit:
         test_perts={"B"},
         seed=42,
     )
-
-
-def test_fit_pca_on_control_only():
-    adata = _make_split_adata()
-    split = _make_split()
-    pca = fit_pca_on_control(adata, split, variance=0.99)
-    assert pca.n_components_ <= 3
-    ctrl_proj = pca.transform(np.asarray(adata[:3].X.todense(), dtype=np.float64))
-    assert ctrl_proj.shape[1] == pca.n_components_
 
 
 def test_compute_pseudobulk_deltas_hand_computed():

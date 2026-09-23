@@ -1,7 +1,6 @@
-"""PCA + MLP baseline model for perturbation-response prediction.
+"""Perturbation-embedding baseline model for perturbation-response prediction.
 
-PCA is fit only on train-split control cells. The MLP takes
-``[PCA(control_mean); perturbation_embedding]`` and predicts the pseudobulk
+The MLP takes a learned perturbation embedding and predicts the pseudobulk
 expression delta Δx = mean(perturbed) - mean(control) for that perturbation,
 restricted to the highly-variable genes selected during preprocessing.
 
@@ -12,13 +11,10 @@ during training (val/test in the perturbation-level split).
 
 from __future__ import annotations
 
-from typing import Optional
-
 import anndata as ad
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.decomposition import PCA
 
 from perturbgpt.data.splitting import CONTROL_LABEL, PerturbationSplit
 
@@ -26,12 +22,10 @@ UNKNOWN_IDX = 0  # reserved embedding index for unseen perturbations
 
 
 class BaselineModel(nn.Module):
-    """PCA features + perturbation embedding → MLP → predicted Δx.
+    """Perturbation embedding → MLP → predicted Δx.
 
     Parameters
     ----------
-    pca_dim : int
-        Dimensionality of the PCA-reduced control expression.
     embed_dim : int
         Dimensionality of the learned perturbation embedding.
     hidden_dim : int
@@ -48,7 +42,6 @@ class BaselineModel(nn.Module):
 
     def __init__(
         self,
-        pca_dim: int,
         embed_dim: int,
         hidden_dim: int,
         num_layers: int,
@@ -65,7 +58,7 @@ class BaselineModel(nn.Module):
             self.embedding.weight[UNKNOWN_IDX].zero_()
 
         layers: list[nn.Module] = []
-        in_dim = pca_dim + embed_dim
+        in_dim = embed_dim
         for _ in range(max(num_layers, 1)):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ReLU())
@@ -74,17 +67,13 @@ class BaselineModel(nn.Module):
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, n_hvgs))
         self.mlp = nn.Sequential(*layers)
-        self.pca_dim = pca_dim
         self.n_hvgs = n_hvgs
 
-    def forward(self, pca_features: torch.Tensor, pert_idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, pert_idx: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Parameters
         ----------
-        pca_features : Tensor [batch, pca_dim]
-            PCA-reduced control expression (same vector for every perturbation,
-            or per-cell if using augmentation).
         pert_idx : Tensor [batch] (long)
             Perturbation embedding indices; 0 = unknown.
 
@@ -94,52 +83,10 @@ class BaselineModel(nn.Module):
             Predicted pseudobulk expression delta Δx.
         """
         emb = self.embedding(pert_idx)
-        x = torch.cat([pca_features, emb], dim=-1)
-        return self.mlp(x)
+        return self.mlp(emb)
 
 
 # ------------------------------------------------------------- data utilities
-
-
-def fit_pca_on_control(
-    adata: ad.AnnData,
-    split: PerturbationSplit,
-    variance: Optional[float] = 0.95,
-    n_components: Optional[int] = None,
-) -> PCA:
-    """Fit PCA on train-split control cells only.
-
-    Parameters
-    ----------
-    adata : AnnData
-        Processed dataset (log-normalized, HVG-subsetted).
-    split : PerturbationSplit
-        The perturbation-level split (control cells are in ``split.train``).
-    variance : float, optional
-        Fraction of variance to explain (e.g. 0.95). If provided, the number
-        of components is automatically determined. Default 0.95.
-    n_components : int, optional
-        Fixed number of components. Used only when ``variance`` is None.
-
-    Returns
-    -------
-    PCA
-        Fitted sklearn PCA object.
-    """
-    perts = adata.obs["perturbation"].astype(str)
-    control_mask = (perts == CONTROL_LABEL) & adata.obs_names.isin(set(split.train))
-    X = adata[control_mask].X
-    if hasattr(X, "toarray"):
-        X = X.toarray()
-    X = np.asarray(X, dtype=np.float64)
-
-    if variance is not None:
-        pca = PCA(n_components=variance, svd_solver="full")
-    else:
-        pca = PCA(n_components=n_components)
-    pca.fit(X)
-    return pca
-
 
 
 def compute_pseudobulk_deltas(
@@ -205,27 +152,4 @@ def build_pert_to_idx(train_perts: set[str]) -> dict[str, int]:
         should be looked up with ``.get(label, UNKNOWN_IDX)``.
     """
     return {pert: i + 1 for i, pert in enumerate(sorted(train_perts))}
-
-
-def transform_pca(pca: PCA, adata: ad.AnnData, cell_names: list[str]) -> np.ndarray:
-    """Apply a fitted PCA to specific cells, returning the PCA features.
-
-    Parameters
-    ----------
-    pca : PCA
-        Fitted PCA object from :func:`fit_pca_on_control`.
-    adata : AnnData
-        Processed dataset.
-    cell_names : list[str]
-        Cell barcodes to transform.
-
-    Returns
-    -------
-    np.ndarray [n_cells, pca_dim]
-    """
-    mask = adata.obs_names.isin(set(cell_names))
-    X = adata[mask].X
-    if hasattr(X, "toarray"):
-        X = X.toarray()
-    return pca.transform(np.asarray(X, dtype=np.float64))
 

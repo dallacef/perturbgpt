@@ -37,7 +37,6 @@ _lit_index = None       # rag/literature_index.LiteratureIndex
 _model_checkpoint = None  # dict from torch.load
 _gene_emb_map = None    # dict[str, np.ndarray]
 _gene_names = None      # list[str] — HVG gene names aligned to model output
-_ctrl_cell_emb = None   # np.ndarray [d_model]
 
 
 def _ensure_pert_index():
@@ -75,7 +74,7 @@ def get_predicted_genes(
     perturbation_id: str,
     top_k: int = 20,
 ) -> list[dict]:
-    """Run the FiLM-MLP model for a perturbation and return top-k DE genes.
+    """Run the gene-embedding MLP model for a perturbation, return top-k genes.
 
     Parameters
     ----------
@@ -90,11 +89,11 @@ def get_predicted_genes(
         Each: ``{"gene": str, "delta": float}`` sorted by ``|delta|`` desc.
         Empty list if the model or embeddings are not available.
     """
-    global _model_checkpoint, _gene_emb_map, _gene_names, _ctrl_cell_emb
+    global _model_checkpoint, _gene_emb_map, _gene_names
 
     try:
         import torch
-        from perturbgpt.models.prediction_head import FiLMMLP, compute_perturbation_embedding
+        from perturbgpt.models.prediction_head import GeneMLP, compute_perturbation_embedding
     except ImportError:
         return []
 
@@ -112,15 +111,11 @@ def get_predicted_genes(
         _gene_emb_map = {s: gene_npz["embeddings"][i] for i, s in enumerate(gene_npz["gene_symbols"].astype(str))}
     if _gene_names is None:
         _gene_names = ckpt.get("gene_names", [])
-    if _ctrl_cell_emb is None:
-        cell_npz = np.load("data/embeddings/cell_embeddings.npz", allow_pickle=True)
-        _ctrl_cell_emb = cell_npz["embeddings"].mean(axis=0).astype(np.float32)
 
-    model = FiLMMLP(
-        cell_emb_dim=cfg.get("cell_emb_dim", 512),
+    model = GeneMLP(
         pert_emb_dim=cfg.get("pert_emb_dim", 512),
         hidden_dim=cfg.get("hidden_dim", 256),
-        num_layers=cfg.get("num_layers", 3),
+        num_layers=cfg.get("num_layers", 2),
         n_hvgs=cfg.get("n_hvgs", len(_gene_names)),
         dropout=0.0,
     )
@@ -128,13 +123,12 @@ def get_predicted_genes(
     model.eval()
 
     d_model = cfg.get("pert_emb_dim", 512)
-    cell_feat = torch.tensor(_ctrl_cell_emb[np.newaxis, :], dtype=torch.float32)
     pert_feat = torch.tensor(
         compute_perturbation_embedding(perturbation_id, _gene_emb_map, d_model)[np.newaxis, :],
         dtype=torch.float32,
     )
     with torch.no_grad():
-        delta = model(cell_feat, pert_feat).cpu().numpy()[0]
+        delta = model(pert_feat).cpu().numpy()[0]
 
     order = np.argsort(-np.abs(delta))[:top_k]
     return [

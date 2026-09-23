@@ -1,35 +1,29 @@
 # Architecture hyperparameters for the baseline and prediction-head models.
 
 baseline:
-  # PCA is fit on train-split control cells; the number of components is
-  # automatically chosen as the minimum that explains this fraction of
-  # variance (0.95 = 95%). Set to null to use a fixed pca_components instead.
-  pca_variance: 0.95
-  pca_components: null      # used only when pca_variance is null
+  # Learned perturbation embedding (one row per perturbation identity) fed
+  # through an MLP. No cell-state or expression features are used.
   embed_dim: 64
-  hidden_dim: 128
+  hidden_dim: 256
   num_layers: 2
   dropout: 0.1
   lr: 1.0e-3
   epochs: 100
-  batch_size: 32
   early_stopping: true
   patience: 10
   top_k: 50
 
 prediction_head:
-  # FiLM-conditioned MLP: cell embedding modulated by perturbation gene embedding.
-  # cell/pert emb dims are auto-detected from cached embeddings at runtime;
+  # Frozen scGPT gene embedding (summed per perturbation) fed through an MLP.
+  # The embedding dim is auto-detected from the cached embeddings at runtime;
   # these defaults are used only if the config is read without the cache.
-  cell_emb_dim: 512
   pert_emb_dim: 512
   hidden_dim: 256
-  num_layers: 3
-  dropout: 0.2
+  num_layers: 2
+  dropout: 0.1
   lr: 1.0e-4
   weight_decay: 1.0e-5
   epochs: 100
-  batch_size: 64
   early_stopping: true
   patience: 10
   top_k: 50

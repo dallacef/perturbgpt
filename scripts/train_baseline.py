@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Train and evaluate the PCA+MLP baseline on the perturbation-level split.
+"""Train and evaluate the perturbation-embedding baseline.
 
-Trains on train-split perturbations, evaluates on val/test using MSE, MAE,
-Pearson/Spearman correlation, and top-k gene recovery, then appends results
-to ``results/metrics.csv`` (one row per model/split/run).
+Trains on train-split perturbations (using only a learned perturbation
+embedding — no cell-state or expression features), evaluates on val/test
+using MSE, MAE, Pearson/Spearman correlation, and top-k gene recovery, then
+appends results to ``results/metrics.csv`` (one row per model/split/run).
 
 Usage
 -----
@@ -28,7 +29,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from scipy import sparse as sp
 
 try:
     import wandb
@@ -40,7 +40,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from perturbgpt.data.splitting import (  # noqa: E402
-    CONTROL_LABEL,
     perturbation_split,
     persist_split,
 )
@@ -56,7 +55,6 @@ from perturbgpt.models.baseline import (  # noqa: E402
     BaselineModel,
     build_pert_to_idx,
     compute_pseudobulk_deltas,
-    fit_pca_on_control,
 )
 
 
@@ -69,7 +67,6 @@ def evaluate(
     model: BaselineModel,
     deltas: dict[str, np.ndarray],
     pert_to_idx: dict[str, int],
-    pca_ctrl_mean: np.ndarray,
     device: torch.device,
     top_k: int,
 ) -> dict[str, float]:
@@ -80,20 +77,13 @@ def evaluate(
         return {"pearson": 0.0, "spearman": 0.0, "mse": 0.0, "mae": 0.0,
                 "top50_precision": 0.0, "top50_recall": 0.0}
 
-    n_hvgs = model.n_hvgs
-    pca_dim = model.pca_dim
-    pca_feat = torch.tensor(
-        np.tile(pca_ctrl_mean[np.newaxis, :], (len(perts), 1)),
-        dtype=torch.float32,
-        device=device,
-    )
     indices = torch.tensor(
         [pert_to_idx.get(p, UNKNOWN_IDX) for p in perts],
         dtype=torch.long,
         device=device,
     )
     with torch.no_grad():
-        preds = model(pca_feat, indices).cpu().numpy()
+        preds = model(indices).cpu().numpy()
 
     trues = np.stack([deltas[p] for p in perts])
     tk = top_k_recovery(preds, trues, k=top_k)
@@ -238,8 +228,6 @@ def main(argv=None) -> int:
         else:
             run_config = {
                 "seed": seed,
-                "pca_variance": model_cfg.get("pca_variance"),
-                "pca_components": model_cfg.get("pca_components"),
                 "embed_dim": model_cfg["embed_dim"],
                 "hidden_dim": model_cfg["hidden_dim"],
                 "num_layers": model_cfg["num_layers"],
@@ -262,7 +250,7 @@ def main(argv=None) -> int:
             )
             # Sweep agent overrides: wandb.config may contain hyperparameters
             # injected by the sweep controller. These take precedence.
-            for key in ("lr", "embed_dim", "hidden_dim", "num_layers", "dropout", "pca_variance"):
+            for key in ("lr", "embed_dim", "hidden_dim", "num_layers", "dropout"):
                 if key in wandb.config:
                     model_cfg[key] = wandb.config[key]
                     print(f"  sweep override: {key} = {wandb.config[key]}")
@@ -273,16 +261,6 @@ def main(argv=None) -> int:
     processed_path = PROJECT_ROOT / data_cfg["dataset"]["processed_file"]
     adata = ad.read_h5ad(processed_path)
     print(f"Loaded processed data: {adata.n_obs} cells x {adata.n_vars} genes")
-
-    # Apply log1p if the data was not log-transformed during preprocessing.
-    if not data_cfg["preprocessing"].get("log1p", True):
-        print("Applying log1p transformation (preprocessing.log1p was false)...")
-        if sp.issparse(adata.X):
-            adata.X = adata.X.copy()
-            adata.X.data = np.log1p(adata.X.data)
-        else:
-            adata.X = np.log1p(np.asarray(adata.X, dtype=np.float64))
-        print("  log1p applied to expression matrix")
 
     # 2. Build perturbation-level split
     ps_cfg = train_cfg["splitting"]["perturbation_split"]
@@ -298,44 +276,26 @@ def main(argv=None) -> int:
     persist_dir = PROJECT_ROOT / train_cfg["splitting"]["persist_dir"]
     persist_split(split, persist_dir / "perturbation_split.json")
 
-    # 3. Fit PCA on train control cells (95% variance by default)
-    variance = model_cfg.get("pca_variance", 0.95)
-    n_comp = model_cfg.get("pca_components")
-    pca = fit_pca_on_control(adata, split, variance=variance, n_components=n_comp)
-    pca_dim = pca.n_components_
-    print(f"PCA: {pca_dim} components (variance threshold={variance})")
-    if use_wandb:
-        wandb.log({"pca_dim": pca_dim, "num_train_perts": len(split.train_perts),
-                    "num_val_perts": len(split.val_perts), "num_test_perts": len(split.test_perts)})
-
-    # PCA-project the control mean expression
-    perts_col = adata.obs["perturbation"].astype(str)
-    ctrl_mask = (perts_col == CONTROL_LABEL) & adata.obs_names.isin(set(split.train))
-    X_ctrl = adata[ctrl_mask].X
-    if hasattr(X_ctrl, "toarray"):
-        X_ctrl = X_ctrl.toarray()
-    ctrl_mean_expr = np.asarray(X_ctrl, dtype=np.float64).mean(axis=0)
-    pca_ctrl_mean = pca.transform(ctrl_mean_expr[np.newaxis, :])[0]
-
-    # 4. Compute pseudobulk deltas for each split
+    # 3. Compute pseudobulk deltas on RAW expression (same space as the
+    #    film head targets).
     all_deltas = compute_pseudobulk_deltas(adata, split)
     train_deltas = {p: d for p, d in all_deltas.items() if p in split.train_perts}
     val_deltas = {p: d for p, d in all_deltas.items() if p in split.val_perts}
     test_deltas = {p: d for p, d in all_deltas.items() if p in split.test_perts}
     print(f"Deltas: train={len(train_deltas)} val={len(val_deltas)} test={len(test_deltas)}")
 
-    # 5. Build pert-to-idx and model
+    # 4. Build pert-to-idx and model
     pert_to_idx = build_pert_to_idx(split.train_perts)
     n_hvgs = adata.n_vars
     model = BaselineModel(
-        pca_dim=pca_dim, embed_dim=model_cfg["embed_dim"],
+        embed_dim=model_cfg["embed_dim"],
         hidden_dim=model_cfg["hidden_dim"], num_layers=model_cfg["num_layers"],
         n_hvgs=n_hvgs, num_perts=len(pert_to_idx), dropout=model_cfg["dropout"],
     ).to(device)
 
 
 
-    # 6. Train
+    # 5. Train
     lr = model_cfg["lr"]
     epochs = args.epochs if args.epochs is not None else model_cfg["epochs"]
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -344,10 +304,6 @@ def main(argv=None) -> int:
     train_perts = sorted(train_deltas.keys())
     train_targets = torch.tensor(
         np.stack([train_deltas[p] for p in train_perts]),
-        dtype=torch.float32, device=device,
-    )
-    train_pca_feat = torch.tensor(
-        np.tile(pca_ctrl_mean[np.newaxis, :], (len(train_perts), 1)),
         dtype=torch.float32, device=device,
     )
     train_indices = torch.tensor(
@@ -364,10 +320,6 @@ def main(argv=None) -> int:
 
     # Precompute val tensors for efficient per-epoch evaluation
     val_perts_sorted = sorted(val_deltas.keys()) if val_deltas else []
-    val_pca_feat = torch.tensor(
-        np.tile(pca_ctrl_mean[np.newaxis, :], (len(val_perts_sorted), 1)),
-        dtype=torch.float32, device=device,
-    ) if val_perts_sorted else None
     val_indices = torch.tensor(
         [pert_to_idx.get(p, UNKNOWN_IDX) for p in val_perts_sorted],
         dtype=torch.long, device=device,
@@ -380,7 +332,7 @@ def main(argv=None) -> int:
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
-        preds = model(train_pca_feat, train_indices)
+        preds = model(train_indices)
         loss = loss_fn(preds, train_targets)
         loss.backward()
         optimizer.step()
@@ -390,7 +342,7 @@ def main(argv=None) -> int:
         val_loss = float("inf")
         if val_perts_sorted:
             with torch.no_grad():
-                vp = model(val_pca_feat, val_indices)
+                vp = model(val_indices)
                 val_loss = float(loss_fn(vp, val_targets))
 
         # Print + log to wandb at log_interval or first epoch
@@ -402,7 +354,7 @@ def main(argv=None) -> int:
         # Full val metrics (pearson, spearman, mse, mae, top-k) every full_val_interval
         if val_perts_sorted and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
             with torch.no_grad():
-                val_preds_np = model(val_pca_feat, val_indices).cpu().numpy()
+                val_preds_np = model(val_indices).cpu().numpy()
             val_trues_np = np.stack([val_deltas[p] for p in val_perts_sorted])
             val_metrics = {
                 "val/pearson": pearson_corr(val_preds_np, val_trues_np),
@@ -428,13 +380,13 @@ def main(argv=None) -> int:
                     print(f"Early stopping at epoch {epoch+1}")
                     break
 
-    # 7. Evaluate on val and test
+    # 6. Evaluate on val and test
     results_path = Path(args.results)
     for split_name, deltas in [("val", val_deltas), ("test", test_deltas)]:
         if not deltas:
             print(f"No perturbations in {split_name} split, skipping.")
             continue
-        metrics = evaluate(model, deltas, pert_to_idx, pca_ctrl_mean, device, top_k)
+        metrics = evaluate(model, deltas, pert_to_idx, device, top_k)
         print(f"\n=== {split_name} metrics ===")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")

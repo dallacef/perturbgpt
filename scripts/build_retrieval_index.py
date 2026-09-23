@@ -90,33 +90,28 @@ def load_predicted_response_vectors(
     checkpoint_path: Path,
     gene_emb_map: dict[str, np.ndarray],
     pert_labels: list[str],
-    ctrl_cell_emb_path: Path,
     device: str = "cpu",
 ) -> np.ndarray:
-    """Load a trained FiLM-MLP checkpoint and predict Δx̂ per perturbation.
+    """Load a trained gene-embedding MLP checkpoint and predict Δx̂ per perturbation.
 
-    Falls back to None if the checkpoint or cell embeddings are not
-    available; the caller should then use pseudobulk deltas.
+    Falls back to None if the checkpoint is not available; the caller should
+    then use pseudobulk deltas.
     """
     import torch
-    from perturbgpt.models.prediction_head import FiLMMLP, compute_perturbation_embedding
+    from perturbgpt.models.prediction_head import GeneMLP, compute_perturbation_embedding
 
     if not checkpoint_path.exists():
-        return None
-    if not ctrl_cell_emb_path.exists():
         return None
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get("model_config", {})
-    cell_emb_dim = cfg.get("cell_emb_dim", 512)
     pert_emb_dim = cfg.get("pert_emb_dim", 512)
     hidden_dim = cfg.get("hidden_dim", 256)
-    num_layers = cfg.get("num_layers", 3)
+    num_layers = cfg.get("num_layers", 2)
     n_hvgs = cfg.get("n_hvgs")
     dropout = cfg.get("dropout", 0.0)
 
-    model = FiLMMLP(
-        cell_emb_dim=cell_emb_dim,
+    model = GeneMLP(
         pert_emb_dim=pert_emb_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
@@ -126,20 +121,13 @@ def load_predicted_response_vectors(
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    cell_npz = np.load(ctrl_cell_emb_path, allow_pickle=True)
-    ctrl_emb = cell_npz["embeddings"].mean(axis=0).astype(np.float32)
-
     d_model = pert_emb_dim
-    cell_feat = torch.tensor(
-        np.tile(ctrl_emb[np.newaxis, :], (len(pert_labels), 1)),
-        dtype=torch.float32, device=device,
-    )
     pert_feat = torch.tensor(
         np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in pert_labels]),
         dtype=torch.float32, device=device,
     )
     with torch.no_grad():
-        preds = model(cell_feat, pert_feat).cpu().numpy()
+        preds = model(pert_feat).cpu().numpy()
     return preds
 
 
@@ -333,13 +321,12 @@ def main(argv=None) -> int:
 
     if args.checkpoint:
         checkpoint_path = Path(args.checkpoint)
-        ctrl_cell_emb_path = embeddings_dir / "cell_embeddings.npz"
         print(f"  Loading predicted response vectors from checkpoint {checkpoint_path} ...")
         response_vectors = load_predicted_response_vectors(
-            checkpoint_path, gene_emb_map, pert_labels, ctrl_cell_emb_path,
+            checkpoint_path, gene_emb_map, pert_labels,
         )
         if response_vectors is not None:
-            response_source = "predicted_film_mlp"
+            response_source = "predicted_gene_mlp"
             print(f"  Predicted {response_vectors.shape[0]} response vectors "
                   f"of dim {response_vectors.shape[1]}")
         else:

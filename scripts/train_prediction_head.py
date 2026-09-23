@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Train and evaluate the FiLM-conditioned MLP prediction head.
+"""Train and evaluate the gene-embedding MLP prediction head.
 
-Loads cached scGPT cell and gene embeddings (from
-``scripts/build_embeddings.py``), trains a FiLM-MLP that modulates a
-cell-embedding network with per-layer scale/shift parameters derived
-from the perturbation gene embedding, and predicts the pseudobulk
-expression delta Δx over the same HVG gene set used by the baseline.
+Loads cached scGPT gene embeddings (from ``scripts/build_embeddings.py``),
+maps each perturbation to a summed gene embedding, and trains an MLP to
+predict the pseudobulk expression delta Δx over the same HVG gene set used
+by the baseline. There is no cell-state input — the model predicts
+perturbation effects from gene identity alone.
 
 The split is **identical** to the one used by
 ``scripts/train_baseline.py`` (same seed, same perturbation-level
 partition), and evaluation uses the **same** ``eval/prediction_metrics.py``
 functions (MSE, MAE, Pearson/Spearman, top-k).  Results are appended to
 the same ``results/metrics.csv`` so the two models are directly
-comparable.  A markdown comparison table (baseline vs. FiLM head) is
-printed at the end.
+comparable.  A markdown comparison table (baseline vs. gene-embedding MLP)
+is printed at the end.
 
 Usage
 -----
@@ -48,7 +48,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from perturbgpt.data.splitting import (  # noqa: E402
-    CONTROL_LABEL,
     perturbation_split,
     persist_split,
 )
@@ -61,7 +60,7 @@ from perturbgpt.eval.prediction_metrics import (  # noqa: E402
 )
 from perturbgpt.models.baseline import compute_pseudobulk_deltas  # noqa: E402
 from perturbgpt.models.prediction_head import (  # noqa: E402
-    FiLMMLP,
+    GeneMLP,
     compute_perturbation_embedding,
 )
 
@@ -72,43 +71,29 @@ def load_config(path: Path) -> dict:
         return yaml.safe_load(fh)
 
 
-def load_cached_embeddings(embeddings_dir: Path) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], int]:
-    """Load cached scGPT cell and gene embeddings from NPZ files.
+def load_gene_embeddings(embeddings_dir: Path) -> tuple[dict[str, np.ndarray], int]:
+    """Load cached scGPT gene embeddings from the NPZ file.
 
     Returns
     -------
-    cell_emb_map : dict[str, np.ndarray]
-        Maps cell barcode → embedding vector ``[d_model]``.
     gene_emb_map : dict[str, np.ndarray]
         Maps gene symbol → embedding vector ``[d_model]``.
     d_model : int
         Embedding dimensionality.
     """
-    cell_path = embeddings_dir / "cell_embeddings.npz"
     gene_path = embeddings_dir / "gene_embeddings.npz"
-    if not cell_path.exists():
-        raise FileNotFoundError(
-            f"Cached cell embeddings not found at {cell_path}. "
-            "Run scripts/build_embeddings.py first."
-        )
     if not gene_path.exists():
         raise FileNotFoundError(
             f"Cached gene embeddings not found at {gene_path}. "
             "Run scripts/build_embeddings.py first."
         )
 
-    cell_npz = np.load(cell_path, allow_pickle=True)
-    cell_emb = cell_npz["embeddings"]
-    cell_ids = cell_npz["cell_ids"].astype(str)
-    cell_emb_map = {cid: cell_emb[i] for i, cid in enumerate(cell_ids)}
-
     gene_npz = np.load(gene_path, allow_pickle=True)
     gene_emb = gene_npz["embeddings"]
     gene_syms = gene_npz["gene_symbols"].astype(str)
     gene_emb_map = {gs: gene_emb[i] for i, gs in enumerate(gene_syms)}
 
-    d_model = int(cell_emb.shape[1])
-    return cell_emb_map, gene_emb_map, d_model
+    return gene_emb_map, int(gene_emb.shape[1])
 
 
 def append_results(
@@ -139,73 +124,15 @@ def append_results(
         writer.writerow(row)
 
 
-def build_training_tensors(
-    adata: ad.AnnData,
-    split,
-    cell_emb_map: dict[str, np.ndarray],
-    gene_emb_map: dict[str, np.ndarray],
-    train_deltas: dict[str, np.ndarray],
-    d_model: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build per-cell training tensors.
-
-    Each train-split cell contributes one sample:
-        cell_emb[cell]            -- the scGPT embedding of that cell
-        pert_emb[cell's pert]     -- the scGPT gene embedding for the perturbation
-        target = delta[that pert] -- the pseudobulk delta for that perturbation
-
-    Returns
-    -------
-    cell_embs : Tensor [n_train_cells, d_model]
-    pert_embs : Tensor [n_train_cells, d_model]
-    targets   : Tensor [n_train_cells, n_hvgs]
-    """
-    perts_col = adata.obs["perturbation"].astype(str)
-    train_cell_set = set(split.train)
-
-    cell_list, pert_list, target_list = [], [], []
-    for cell_id in adata.obs_names:
-        if cell_id not in train_cell_set:
-            continue
-        if cell_id not in cell_emb_map:
-            continue
-        pert = str(perts_col.loc[cell_id])
-        if pert == CONTROL_LABEL:
-            continue
-        if pert not in train_deltas:
-            continue
-        cell_list.append(cell_emb_map[cell_id])
-        pert_list.append(compute_perturbation_embedding(pert, gene_emb_map, d_model))
-        target_list.append(train_deltas[pert])
-
-    if not cell_list:
-        raise RuntimeError(
-            "No training cells with matching cached embeddings found. "
-            "Ensure build_embeddings.py was run on the same dataset."
-        )
-
-    cell_embs = torch.tensor(np.stack(cell_list), dtype=torch.float32, device=device)
-    pert_embs = torch.tensor(np.stack(pert_list), dtype=torch.float32, device=device)
-    targets = torch.tensor(np.stack(target_list), dtype=torch.float32, device=device)
-    return cell_embs, pert_embs, targets
-
-
 def evaluate(
-    model: FiLMMLP,
+    model: GeneMLP,
     deltas: dict[str, np.ndarray],
     gene_emb_map: dict[str, np.ndarray],
-    ctrl_cell_emb: np.ndarray,
     d_model: int,
     device: torch.device,
     top_k: int,
 ) -> dict[str, float]:
-    """Evaluate model predictions against true pseudobulk deltas.
-
-    Uses the mean control-cell embedding as the carrier signal (analogous
-    to the baseline's ``pca_ctrl_mean``) and the perturbation gene embedding
-    as the FiLM condition.
-    """
+    """Evaluate model predictions against true pseudobulk deltas."""
     model.eval()
     perts = sorted(deltas.keys())
     if not perts:
@@ -214,16 +141,12 @@ def evaluate(
             "top50_precision": 0.0, "top50_recall": 0.0,
         }
 
-    cell_feat = torch.tensor(
-        np.tile(ctrl_cell_emb[np.newaxis, :], (len(perts), 1)),
-        dtype=torch.float32, device=device,
-    )
     pert_feat = torch.tensor(
         np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in perts]),
         dtype=torch.float32, device=device,
     )
     with torch.no_grad():
-        preds = model(cell_feat, pert_feat).cpu().numpy()
+        preds = model(pert_feat).cpu().numpy()
 
     trues = np.stack([deltas[p] for p in perts])
     tk = top_k_recovery(preds, trues, k=top_k)
@@ -357,7 +280,6 @@ def main(argv=None) -> int:
     parser.add_argument("--results", default=str(PROJECT_ROOT / "results" / "metrics.csv"))
     parser.add_argument("--epochs", type=int, default=None, help="override config epochs")
     parser.add_argument("--seed", type=int, default=None, help="override config seed")
-    parser.add_argument("--batch-size", type=int, default=None, help="override config batch_size")
     parser.add_argument("--use-wandb", action="store_true", help="enable W&B tracking")
     parser.add_argument("--wandb-project", default=None, help="W&B project name")
     parser.add_argument("--wandb-run-name", default=None, help="W&B run name")
@@ -389,7 +311,6 @@ def main(argv=None) -> int:
     if use_wandb:
         run_config = {
             "seed": seed,
-            "cell_emb_dim": model_cfg["cell_emb_dim"],
             "pert_emb_dim": model_cfg["pert_emb_dim"],
             "hidden_dim": model_cfg["hidden_dim"],
             "num_layers": model_cfg["num_layers"],
@@ -431,21 +352,19 @@ def main(argv=None) -> int:
     persist_dir = PROJECT_ROOT / train_cfg["splitting"]["persist_dir"]
     persist_split(split, persist_dir / "perturbation_split.json")
 
-    # 3. Load cached scGPT embeddings
+    # 3. Load cached scGPT gene embeddings
     embeddings_dir = Path(args.embeddings_dir)
-    print(f"Loading cached embeddings from {embeddings_dir} ...")
-    cell_emb_map, gene_emb_map, d_model = load_cached_embeddings(embeddings_dir)
-    print(f"  {len(cell_emb_map)} cell embeddings, {len(gene_emb_map)} gene embeddings, d_model={d_model}")
+    print(f"Loading cached gene embeddings from {embeddings_dir} ...")
+    gene_emb_map, d_model = load_gene_embeddings(embeddings_dir)
+    print(f"  {len(gene_emb_map)} gene embeddings, d_model={d_model}")
 
-    # Use cached d_model if the config left emb dims unset or mismatched
-    cell_emb_dim = model_cfg.get("cell_emb_dim", d_model)
+    # Use cached d_model if the config left the emb dim unset or mismatched
     pert_emb_dim = model_cfg.get("pert_emb_dim", d_model)
-    if cell_emb_dim != d_model or pert_emb_dim != d_model:
+    if pert_emb_dim != d_model:
         print(
-            f"  WARNING: config emb dims (cell={cell_emb_dim}, pert={pert_emb_dim}) "
-            f"do not match cached d_model={d_model}; using cached d_model."
+            f"  WARNING: config pert_emb_dim ({pert_emb_dim}) does not match "
+            f"cached d_model={d_model}; using cached d_model."
         )
-        cell_emb_dim = d_model
         pert_emb_dim = d_model
 
     # 4. Compute pseudobulk deltas (identical to baseline)
@@ -455,40 +374,33 @@ def main(argv=None) -> int:
     test_deltas = {p: d for p, d in all_deltas.items() if p in split.test_perts}
     print(f"Deltas: train={len(train_deltas)} val={len(val_deltas)} test={len(test_deltas)}")
 
-    # 5. Compute mean control-cell scGPT embedding (for evaluation)
-    perts_col = adata.obs["perturbation"].astype(str)
-    ctrl_mask = (perts_col == CONTROL_LABEL) & adata.obs_names.isin(set(split.train))
-    ctrl_cell_ids = adata.obs_names[ctrl_mask].tolist()
-    ctrl_embs = [cell_emb_map[c] for c in ctrl_cell_ids if c in cell_emb_map]
-    if not ctrl_embs:
-        raise RuntimeError("No control cells with matching cached embeddings found.")
-    ctrl_cell_emb = np.mean(ctrl_embs, axis=0).astype(np.float32)
-    print(f"Mean control cell embedding from {len(ctrl_embs)} cells")
-
-
-    # 6. Build model
+    # 5. Build model
     n_hvgs = adata.n_vars
-    model = FiLMMLP(
-        cell_emb_dim=cell_emb_dim,
+    model = GeneMLP(
         pert_emb_dim=pert_emb_dim,
         hidden_dim=model_cfg["hidden_dim"],
         num_layers=model_cfg["num_layers"],
         n_hvgs=n_hvgs,
         dropout=model_cfg["dropout"],
     ).to(device)
-    print(f"Model: FiLMMLP(cell_emb_dim={cell_emb_dim}, pert_emb_dim={pert_emb_dim}, "
+    print(f"Model: GeneMLP(pert_emb_dim={pert_emb_dim}, "
           f"hidden={model_cfg['hidden_dim']}, layers={model_cfg['num_layers']}, n_hvgs={n_hvgs})")
 
-    # 7. Build training tensors (per-cell)
-    train_cell, train_pert, train_targets = build_training_tensors(
-        adata, split, cell_emb_map, gene_emb_map, train_deltas, d_model, device,
+    # 6. Build training tensors (per-perturbation)
+    train_perts = sorted(train_deltas.keys())
+    train_pert = torch.tensor(
+        np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in train_perts]),
+        dtype=torch.float32, device=device,
     )
-    print(f"Training samples: {train_cell.shape[0]} cells")
+    train_targets = torch.tensor(
+        np.stack([train_deltas[p] for p in train_perts]),
+        dtype=torch.float32, device=device,
+    )
+    print(f"Training samples: {len(train_perts)} perturbations")
 
-    # 8. Training loop
+    # 7. Training loop
     lr = model_cfg["lr"]
     epochs = args.epochs if args.epochs is not None else model_cfg["epochs"]
-    batch_size = args.batch_size if args.batch_size is not None else model_cfg.get("batch_size", 64)
     weight_decay = model_cfg.get("weight_decay", 1e-5)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.MSELoss()
@@ -498,9 +410,6 @@ def main(argv=None) -> int:
     log_interval = wandb_cfg.get("log_interval", 1)
     full_val_interval = wandb_cfg.get("full_val_interval", 5)
 
-    n_samples = train_cell.shape[0]
-    indices = np.arange(n_samples)
-
     # Precompute val evaluation tensors
     val_perts_sorted = sorted(val_deltas.keys()) if val_deltas else []
 
@@ -509,31 +418,17 @@ def main(argv=None) -> int:
 
     for epoch in range(epochs):
         model.train()
-        np.random.shuffle(indices)
-        epoch_loss = 0.0
-        n_batches = 0
-
-        for start in range(0, n_samples, batch_size):
-            batch_idx = indices[start:start + batch_size]
-            optimizer.zero_grad()
-            preds = model(train_cell[batch_idx], train_pert[batch_idx])
-            loss = loss_fn(preds, train_targets[batch_idx])
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            n_batches += 1
-
-        avg_train_loss = epoch_loss / max(n_batches, 1)
+        optimizer.zero_grad()
+        preds = model(train_pert)
+        loss = loss_fn(preds, train_targets)
+        loss.backward()
+        optimizer.step()
 
         # Evaluate val loss every epoch
         model.eval()
         val_loss = float("inf")
         if val_perts_sorted:
             with torch.no_grad():
-                vc = torch.tensor(
-                    np.tile(ctrl_cell_emb[np.newaxis, :], (len(val_perts_sorted), 1)),
-                    dtype=torch.float32, device=device,
-                )
                 vp = torch.tensor(
                     np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model)
                               for p in val_perts_sorted]),
@@ -543,17 +438,17 @@ def main(argv=None) -> int:
                     np.stack([val_deltas[p] for p in val_perts_sorted]),
                     dtype=torch.float32, device=device,
                 )
-                val_loss = float(loss_fn(model(vc, vp), vt))
+                val_loss = float(loss_fn(model(vp), vt))
 
         if (epoch + 1) % log_interval == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}/{epochs}  train_loss={avg_train_loss:.6f}  val_loss={val_loss:.6f}")
+            print(f"Epoch {epoch+1:3d}/{epochs}  train_loss={loss.item():.6f}  val_loss={val_loss:.6f}")
             if use_wandb:
-                wandb.log({"epoch": epoch + 1, "train_loss": avg_train_loss, "val_loss": val_loss})
+                wandb.log({"epoch": epoch + 1, "train_loss": loss.item(), "val_loss": val_loss})
 
         # Full val metrics every full_val_interval
         if val_perts_sorted and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
             val_metrics = evaluate(
-                model, val_deltas, gene_emb_map, ctrl_cell_emb, d_model, device, top_k,
+                model, val_deltas, gene_emb_map, d_model, device, top_k,
             )
             if use_wandb:
                 wandb.log({f"val/{k}": v for k, v in val_metrics.items()})
@@ -570,14 +465,14 @@ def main(argv=None) -> int:
                     print(f"Early stopping at epoch {epoch+1}")
                     break
 
-    # 9. Evaluate on val and test
+    # 8. Evaluate on val and test
     results_path = Path(args.results)
     final_metrics: dict[str, dict[str, float]] = {}
     for split_name, deltas in [("val", val_deltas), ("test", test_deltas)]:
         if not deltas:
             print(f"No perturbations in {split_name} split, skipping.")
             continue
-        metrics = evaluate(model, deltas, gene_emb_map, ctrl_cell_emb, d_model, device, top_k)
+        metrics = evaluate(model, deltas, gene_emb_map, d_model, device, top_k)
         print(f"\n=== {split_name} metrics ===")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
@@ -590,7 +485,7 @@ def main(argv=None) -> int:
 
     print(f"\nResults appended to {results_path}")
 
-    # 10. Print comparison table
+    # 9. Print comparison table
     print_comparison_table(results_path, final_metrics)
 
     if use_wandb:
