@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot predicted vs. true pseudobulk deltas for the baseline and gene-MLP models.
+"""Plot predicted vs. true pseudobulk deltas for the baseline and FiLM models.
 
 Trains both models in-memory on the same perturbation-level split, then
 scatters predicted vs. true Δx per gene for a selection of test-split
@@ -7,11 +7,10 @@ perturbations spanning strong, medium, and weak effect sizes. Each panel is
 annotated with Pearson r, MAE, and the OLS slope of ``pred`` on ``true`` —
 a slope far from 1.0 flags a scale mismatch.
 
-Both models map a perturbation representation to Δx and use **no cell-state
-input**:
-
 * **baseline** — a learned ``nn.Embedding`` over perturbation identities.
-* **film_head** — summed frozen scGPT gene embeddings.
+* **film_head** — a FiLM-conditioned head over summed frozen scGPT gene
+  embeddings and individual control-cell embeddings (predictions averaged
+  over all control cells).
 
 Usage
 -----
@@ -37,22 +36,26 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 import yaml  # noqa: E402
+from torch.utils.data import DataLoader, Dataset  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import anndata as ad  # noqa: E402
 
-from perturbgpt.data.splitting import perturbation_split  # noqa: E402
+from perturbgpt.data.splitting import CONTROL_LABEL, perturbation_split  # noqa: E402
 from perturbgpt.eval.prediction_metrics import mae, pearson_corr  # noqa: E402
 from perturbgpt.models.baseline import (  # noqa: E402
     UNKNOWN_IDX,
     BaselineModel,
     build_pert_to_idx,
+    compute_control_statistics,
     compute_pseudobulk_deltas,
+    standardize_deltas,
+    unstandardize_predictions,
 )
 from perturbgpt.models.prediction_head import (  # noqa: E402
-    GeneMLP,
+    FiLMPredictionHead,
     compute_perturbation_embedding,
 )
 
@@ -74,6 +77,45 @@ def load_gene_embeddings(embeddings_dir: Path) -> tuple[dict, int]:
     return gene_emb_map, int(emb.shape[1])
 
 
+def load_cell_embeddings(embeddings_dir: Path) -> tuple[np.ndarray, list[str]]:
+    """Load cached scGPT cell embeddings from the NPZ file."""
+    cell_path = embeddings_dir / "cell_embeddings.npz"
+    if not cell_path.exists():
+        raise FileNotFoundError(f"Cached cell embeddings not found at {cell_path}.")
+    npz = np.load(cell_path, allow_pickle=True)
+    cell_emb = npz["embeddings"]
+    cell_ids = npz["cell_ids"].astype(str)
+    return cell_emb, list(cell_ids)
+
+
+def gaussian_nll_loss(
+    mu: torch.Tensor,
+    log_var: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Gaussian NLL of ``target`` under N(mu, exp(log_var)) (constant dropped)."""
+    var = log_var.exp()
+    return 0.5 * (log_var + (target - mu).pow(2) / var).mean()
+
+
+class ControlPertDataset(Dataset):
+    """Cartesian product of control-cell embeddings and perturbations."""
+
+    def __init__(self, ctrl_embs, pert_embs, targets):
+        self.ctrl_embs = ctrl_embs
+        self.pert_embs = pert_embs
+        self.targets = targets
+        self.n_ctrl = int(ctrl_embs.shape[0])
+        self.n_pert = int(pert_embs.shape[0])
+
+    def __len__(self) -> int:
+        return self.n_ctrl * self.n_pert
+
+    def __getitem__(self, idx: int):
+        i, j = divmod(idx, self.n_pert)
+        return self.ctrl_embs[i], self.pert_embs[j], self.targets[j]
+
+
 def ols_slope(true: np.ndarray, pred: np.ndarray) -> float:
     """Ordinary least-squares slope of ``pred`` on ``true`` (NaN if degenerate)."""
     if np.std(true) < 1e-12:
@@ -84,12 +126,15 @@ def ols_slope(true: np.ndarray, pred: np.ndarray) -> float:
 # ------------------------------------------------------------- baseline
 
 
-def train_baseline_model(adata, split, raw_deltas, model_cfg, device, epochs):
+def train_baseline_model(adata, split, raw_deltas, ctrl_sigma, model_cfg, device, epochs):
     """Train the perturbation-embedding baseline.
 
+    Targets are standardized for training; ``test_deltas`` stay raw.
     Returns ``(model, test_deltas, pert_to_idx)``.
     """
-    train_deltas = {p: raw_deltas[p] for p in split.train_perts if p in raw_deltas}
+    train_deltas = standardize_deltas(
+        {p: raw_deltas[p] for p in split.train_perts if p in raw_deltas}, ctrl_sigma,
+    )
     test_deltas = {p: raw_deltas[p] for p in split.test_perts if p in raw_deltas}
 
     pert_to_idx = build_pert_to_idx(split.train_perts)
@@ -125,8 +170,8 @@ def train_baseline_model(adata, split, raw_deltas, model_cfg, device, epochs):
     return model, test_deltas, pert_to_idx
 
 
-def baseline_predictions(model, test_deltas, pert_to_idx, device):
-    """Return ``{pert: (true, pred)}`` for every test-split perturbation."""
+def baseline_predictions(model, test_deltas, pert_to_idx, ctrl_sigma, device):
+    """Return ``{pert: (true, pred)}`` in original delta scale."""
     model.eval()
     perts = sorted(test_deltas.keys())
     indices = torch.tensor(
@@ -134,64 +179,84 @@ def baseline_predictions(model, test_deltas, pert_to_idx, device):
     )
     with torch.no_grad():
         preds = model(indices).cpu().numpy()
+    preds = unstandardize_predictions(preds, ctrl_sigma)
     return {p: (test_deltas[p], preds[i]) for i, p in enumerate(perts)}
 
 
 # ------------------------------------------------------------- gene MLP
 
 
-def train_gene_mlp_model(adata, split, raw_deltas, gene_emb_map, d_model, model_cfg, device, epochs):
-    """Train the gene-embedding MLP.
+def train_film_model(adata, split, raw_deltas, ctrl_sigma, gene_emb_map, d_model, ctrl_embs, model_cfg, device, epochs):
+    """Train the FiLM-conditioned head.
 
-    Returns ``(model, test_deltas, gene_emb_map, d_model)``.
+    Targets are standardized for training; ``test_deltas`` stay raw.
+    Returns ``(model, test_deltas)``.
     """
-    train_deltas = {p: raw_deltas[p] for p in split.train_perts if p in raw_deltas}
+    train_deltas = standardize_deltas(
+        {p: raw_deltas[p] for p in split.train_perts if p in raw_deltas}, ctrl_sigma,
+    )
     test_deltas = {p: raw_deltas[p] for p in split.test_perts if p in raw_deltas}
 
     n_hvgs = adata.n_vars
-    model = GeneMLP(
+    model = FiLMPredictionHead(
         pert_emb_dim=d_model,
+        control_emb_dim=d_model,
         hidden_dim=model_cfg["hidden_dim"],
         num_layers=model_cfg["num_layers"],
         n_hvgs=n_hvgs,
         dropout=model_cfg["dropout"],
+        film_hidden_dim=model_cfg.get("film_hidden_dim"),
     ).to(device)
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=model_cfg["lr"], weight_decay=model_cfg.get("weight_decay", 1e-5),
     )
-    loss_fn = nn.MSELoss()
 
     train_perts = sorted(train_deltas.keys())
-    train_pert = torch.tensor(
+    pert_emb = torch.tensor(
         np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in train_perts]),
         dtype=torch.float32, device=device,
     )
-    train_targets = torch.tensor(
+    targets = torch.tensor(
         np.stack([train_deltas[p] for p in train_perts]), dtype=torch.float32, device=device,
+    )
+
+    batch_size = model_cfg.get("batch_size", 256)
+    loader = DataLoader(
+        ControlPertDataset(ctrl_embs, pert_emb, targets),
+        batch_size=batch_size,
+        shuffle=True,
     )
 
     for _ in range(epochs):
         model.train()
-        optimizer.zero_grad()
-        preds = model(train_pert)
-        loss = loss_fn(preds, train_targets)
-        loss.backward()
-        optimizer.step()
+        for ctrl_batch, pert_batch, target_batch in loader:
+            optimizer.zero_grad()
+            mu, log_var = model(ctrl_batch, pert_batch)
+            loss = gaussian_nll_loss(mu, log_var, target_batch)
+            loss.backward()
+            optimizer.step()
 
-    return model, test_deltas, gene_emb_map, d_model
+    return model, test_deltas
 
 
-def gene_mlp_predictions(model, test_deltas, gene_emb_map, d_model, device):
-    """Return ``{pert: (true, pred)}`` for every test-split perturbation."""
+def film_predictions(model, ctrl_embs, test_deltas, gene_emb_map, d_model, ctrl_sigma, device):
+    """Return ``{pert: (true, pred)}`` in original delta scale, averaging mu over cells."""
     model.eval()
     perts = sorted(test_deltas.keys())
+    n_ctrl = int(ctrl_embs.shape[0])
     pert_feat = torch.tensor(
         np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in perts]),
         dtype=torch.float32, device=device,
     )
+    preds_list = []
     with torch.no_grad():
-        preds = model(pert_feat).cpu().numpy()
+        for j in range(int(pert_feat.shape[0])):
+            ctrl_batch = ctrl_embs.to(device)
+            pert_batch = pert_feat[j].unsqueeze(0).expand(n_ctrl, -1)
+            mu, _log_var = model(ctrl_batch, pert_batch)
+            preds_list.append(mu.mean(dim=0).cpu().numpy())
+    preds = unstandardize_predictions(np.stack(preds_list), ctrl_sigma)
     return {p: (test_deltas[p], preds[i]) for i, p in enumerate(perts)}
 
 
@@ -230,7 +295,7 @@ def plot_grid(
     """Plot a ``n_perts × 2`` grid of pred-vs-true scatter panels."""
     models = [
         ("baseline (learned embedding)", baseline_preds),
-        ("film_head (scGPT gene embedding)", film_preds),
+        ("film_head (FiLM, control-conditioned)", film_preds),
     ]
     n_perts = len(selected)
     fig, axes = plt.subplots(
@@ -297,7 +362,7 @@ def main(argv=None) -> int:
         default=str(PROJECT_ROOT / "data" / "embeddings"),
     )
     parser.add_argument(
-        "--n-perts", type=int, default=6,
+        "--n-perts", type=int, default=4,
         help="Number of perturbations to plot (strong → weak).",
     )
     parser.add_argument(
@@ -343,23 +408,38 @@ def main(argv=None) -> int:
     selected = select_perturbations(test_raw, args.n_perts)
     print(f"Selected perturbations: {selected}")
 
+    # Per-gene control statistics for target standardization.
+    ctrl_mu, ctrl_sigma = compute_control_statistics(adata, split)
+
     # 2. Baseline (learned perturbation embedding).
     print("\nTraining baseline (perturbation embedding) ...")
     b_epochs = args.epochs or baseline_cfg["epochs"]
     b_model, b_test, b_pert_to_idx = train_baseline_model(
-        adata, split, raw_deltas, baseline_cfg, device, b_epochs,
+        adata, split, raw_deltas, ctrl_sigma, baseline_cfg, device, b_epochs,
     )
-    baseline_preds = baseline_predictions(b_model, b_test, b_pert_to_idx, device)
+    baseline_preds = baseline_predictions(b_model, b_test, b_pert_to_idx, ctrl_sigma, device)
 
-    # 3. Gene-embedding MLP (scGPT gene embeddings).
-    print("Training film_head (gene-embedding MLP) ...")
+    # 3. FiLM head (scGPT gene embeddings + control-cell conditioning).
+    print("Training film_head (FiLM-conditioned) ...")
     gene_emb_map, d_model = load_gene_embeddings(Path(args.embeddings_dir))
     print(f"  {len(gene_emb_map)} gene embeddings, d_model={d_model}")
-    f_epochs = args.epochs or film_cfg["epochs"]
-    f_model, f_test, f_gene, f_d_model = train_gene_mlp_model(
-        adata, split, raw_deltas, gene_emb_map, d_model, film_cfg, device, f_epochs,
+
+    print(f"Loading cached cell embeddings from {args.embeddings_dir} ...")
+    cell_emb, cell_ids = load_cell_embeddings(Path(args.embeddings_dir))
+    cell_id_to_idx = {cid: i for i, cid in enumerate(cell_ids)}
+    ctrl_cells = sorted(
+        set(adata.obs_names[adata.obs["perturbation"].astype(str) == CONTROL_LABEL])
     )
-    film_preds = gene_mlp_predictions(f_model, f_test, f_gene, f_d_model, device)
+    ctrl_idx = np.array([cell_id_to_idx[c] for c in ctrl_cells], dtype=np.int64)
+    ctrl_embs = torch.tensor(cell_emb[ctrl_idx], dtype=torch.float32, device=device)
+    print(f"  {ctrl_embs.shape[0]} control cells")
+
+    f_epochs = args.epochs or film_cfg["epochs"]
+    f_model, f_test = train_film_model(
+        adata, split, raw_deltas, ctrl_sigma, gene_emb_map, d_model, ctrl_embs,
+        film_cfg, device, f_epochs,
+    )
+    film_preds = film_predictions(f_model, ctrl_embs, f_test, gene_emb_map, d_model, ctrl_sigma, device)
 
     # 4. Plot and save.
     plot_grid(selected, baseline_preds, film_preds, raw_deltas, Path(args.output))

@@ -153,3 +153,84 @@ def build_pert_to_idx(train_perts: set[str]) -> dict[str, int]:
     """
     return {pert: i + 1 for i, pert in enumerate(sorted(train_perts))}
 
+
+def compute_control_statistics(
+    adata: ad.AnnData,
+    split: PerturbationSplit,
+    perturbation_col: str = "perturbation",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-gene mean and std from train-split control cells.
+
+    The control distribution defines the "unperturbed" reference, so its
+    per-gene standard deviation is a natural unit for rescaling perturbation
+    effects. Genes with zero control variance are clamped to a std of 1.0 so
+    that standardization never divides by zero.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Processed dataset.
+    split : PerturbationSplit
+        Perturbation-level split; control cells are taken from ``split.train``.
+    perturbation_col : str
+        Column in ``adata.obs`` holding perturbation labels.
+
+    Returns
+    -------
+    (mu, sigma)
+        Per-gene mean and std, both of shape ``[n_genes]``.
+    """
+    perts = adata.obs[perturbation_col].astype(str)
+    control_mask = (perts == CONTROL_LABEL) & adata.obs_names.isin(set(split.train))
+    X = adata[control_mask].X
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+    X = np.asarray(X, dtype=np.float64)
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma = np.where(sigma < 1.0, 1.0, sigma)  # avoid division by zero
+    return mu, sigma
+
+
+def standardize_deltas(
+    deltas: dict[str, np.ndarray],
+    sigma: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Divide each perturbation's delta by the per-gene control std.
+
+    Parameters
+    ----------
+    deltas : dict
+        Mapping perturbation label → Δx vector ``[n_genes]``.
+    sigma : np.ndarray
+        Per-gene control std ``[n_genes]`` from
+        :func:`compute_control_statistics`.
+
+    Returns
+    -------
+    dict
+        Standardized deltas (element-wise ``delta / sigma``).
+    """
+    return {pert: delta / sigma for pert, delta in deltas.items()}
+
+
+def unstandardize_predictions(
+    preds: np.ndarray,
+    sigma: np.ndarray,
+) -> np.ndarray:
+    """Multiply standardized predictions back by the per-gene control std.
+
+    Parameters
+    ----------
+    preds : np.ndarray
+        Standardized predictions, shape ``[n_perts, n_genes]`` or ``[n_genes]``.
+    sigma : np.ndarray
+        Per-gene control std ``[n_genes]``.
+
+    Returns
+    -------
+    np.ndarray
+        Predictions in the original delta scale (``preds * sigma``).
+    """
+    return preds * sigma
+

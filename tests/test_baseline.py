@@ -29,7 +29,10 @@ from perturbgpt.models.baseline import (
     UNKNOWN_IDX,
     BaselineModel,
     build_pert_to_idx,
+    compute_control_statistics,
     compute_pseudobulk_deltas,
+    standardize_deltas,
+    unstandardize_predictions,
 )
 from perturbgpt.data.splitting import CONTROL_LABEL, PerturbationSplit
 
@@ -153,6 +156,49 @@ def test_build_pert_to_idx():
     assert mapping["B"] == 2
     assert mapping["C"] == 3
     assert mapping.get("Z", UNKNOWN_IDX) == UNKNOWN_IDX
+
+
+def test_compute_control_statistics_basic():
+    """Per-gene mean/std from control cells, with zero-std genes clamped."""
+    labels = ["control"] * 4
+    obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(4)])
+    var = pd.DataFrame(index=["g0", "g1", "g2"])
+    X = np.array(
+        [
+            [10.0, 0.0, 100.0],
+            [20.0, 0.0, 104.0],
+            [15.0, 0.0, 102.0],
+            [15.0, 0.0, 102.0],
+        ],
+        dtype=np.float32,
+    )
+    adata = AnnData(sparse.csr_matrix(X), obs=obs, var=var)
+    split = PerturbationSplit(
+        train=["c0", "c1", "c2", "c3"], val=[], test=[],
+        train_perts=set(), val_perts=set(), test_perts=set(), seed=42,
+    )
+
+    mu, sigma = compute_control_statistics(adata, split)
+
+    np.testing.assert_allclose(mu, [15.0, 0.0, 102.0], atol=1e-5)
+    # g0 std > 1 (kept), g1 zero std (clamped to 1.0), g2 std = sqrt(2) (kept).
+    np.testing.assert_allclose(
+        sigma, [np.sqrt(12.5), 1.0, np.sqrt(2.0)], atol=1e-5,
+    )
+
+
+def test_standardize_unstandardize_roundtrip():
+    """standardize_deltas then unstandardize_predictions recovers the originals."""
+    sigma = np.array([1.0, 2.0, 3.0, 4.0])
+    deltas = {
+        "A": np.array([1.0, 2.0, 3.0, 4.0]),
+        "B": np.array([-1.0, -2.0, -3.0, -4.0]),
+    }
+    standardized = standardize_deltas(deltas, sigma)
+    preds = np.stack([standardized["A"], standardized["B"]])
+    recovered = unstandardize_predictions(preds, sigma)
+    np.testing.assert_allclose(recovered[0], deltas["A"], atol=1e-6)
+    np.testing.assert_allclose(recovered[1], deltas["B"], atol=1e-6)
 
 
 

@@ -4,27 +4,31 @@ baseline:
   # Learned perturbation embedding (one row per perturbation identity) fed
   # through an MLP. No cell-state or expression features are used.
   embed_dim: 64
-  hidden_dim: 256
+  hidden_dim: 128
   num_layers: 2
   dropout: 0.1
   lr: 1.0e-3
   epochs: 100
   early_stopping: true
-  patience: 10
+  patience: 15
   top_k: 50
 
 prediction_head:
-  # Frozen scGPT gene embedding (summed per perturbation) fed through an MLP.
-  # The embedding dim is auto-detected from the cached embeddings at runtime;
-  # these defaults are used only if the config is read without the cache.
+  # Frozen scGPT gene embedding (summed per perturbation) conditions a FiLM
+  # backbone driven by the individual control-cell embedding. Embedding dims
+  # are auto-detected from the cached embeddings at runtime; these defaults
+  # are used only if the config is read without the cache.
   pert_emb_dim: 512
+  control_emb_dim: 512
   hidden_dim: 256
-  num_layers: 2
+  num_layers: 3
+  film_hidden_dim: null        # null = reuse hidden_dim
   dropout: 0.1
-  lr: 1.0e-4
+  batch_size: 256              # (control cell, perturbation) pairs per batch
+  lr: 1.0e-3
   weight_decay: 1.0e-5
   epochs: 100
   early_stopping: true
-  patience: 10
+  patience: 15
   top_k: 50
 

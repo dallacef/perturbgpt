@@ -124,6 +124,71 @@ def test_qc_filters_chain_to_expected_cells(adata):
     assert adata.n_obs == 8  # original untouched
 
 
+# ------------------------------------------------- embedding-coverage filter
+
+
+GENE_EMBEDDINGS = {"A", "B", "C"}
+
+
+@pytest.fixture
+def embedding_adata() -> AnnData:
+    """12 cells with single-gene and combinatorial perturbations.
+
+    * ``control``, ``A``, ``B``, ``A_B``  -> all genes have embeddings
+    * ``MISSING``, ``A_MISSING``          -> at least one gene has no embedding
+    """
+    labels = (
+        ["control"] * 2
+        + ["A"] * 2
+        + ["B"] * 2
+        + ["MISSING"] * 2
+        + ["A_B"] * 2
+        + ["A_MISSING"] * 2
+    )
+    obs = pd.DataFrame(
+        {"perturbation": labels},
+        index=[f"cell{i}" for i in range(len(labels))],
+    )
+    var = pd.DataFrame(index=[f"gene{j}" for j in range(4)])
+    X = np.ones((len(labels), 4), dtype=np.float32)
+    return AnnData(sparse.csr_matrix(X), obs=obs, var=var)
+
+
+def test_filter_by_embedding_keeps_control(embedding_adata):
+    out, _ = pp.filter_perturbations_by_embedding_coverage(
+        embedding_adata, GENE_EMBEDDINGS
+    )
+    assert "control" in set(out.obs["perturbation"])
+
+
+def test_filter_by_embedding_drops_missing_single_gene(embedding_adata):
+    out, _ = pp.filter_perturbations_by_embedding_coverage(
+        embedding_adata, GENE_EMBEDDINGS
+    )
+    kept = set(out.obs["perturbation"])
+    assert "A" in kept and "B" in kept
+    assert "MISSING" not in kept
+
+
+def test_filter_by_embedding_drops_partial_combo(embedding_adata):
+    out, _ = pp.filter_perturbations_by_embedding_coverage(
+        embedding_adata, GENE_EMBEDDINGS
+    )
+    kept = set(out.obs["perturbation"])
+    assert "A_B" in kept
+    assert "A_MISSING" not in kept
+
+
+def test_filter_by_embedding_stats_dict(embedding_adata):
+    out, stats = pp.filter_perturbations_by_embedding_coverage(
+        embedding_adata, GENE_EMBEDDINGS
+    )
+    assert stats["n_perts_before"] == 6
+    assert stats["n_perts_after"] == 4
+    assert stats["n_perts_dropped"] == 2
+    assert stats["n_cells_dropped"] == 4
+    assert set(stats["dropped_perturbations"]) == {"MISSING", "A_MISSING"}
+    assert out.n_obs == 8
 
 
 # ------------------------------------------------------------- normalization

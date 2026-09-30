@@ -142,6 +142,69 @@ def filter_doublets(adata: ad.AnnData, column: Optional[str] = None) -> ad.AnnDa
     return adata[~is_doublet].copy()
 
 
+def filter_perturbations_by_embedding_coverage(
+    adata: ad.AnnData,
+    gene_symbols_with_embeddings,
+    perturbation_col: str = "perturbation",
+    combo_separator: str = "_",
+    control_label: str = "control",
+) -> tuple[ad.AnnData, dict]:
+    """Remove cells whose perturbation references genes without embeddings.
+
+    A perturbation is kept only when **every** constituent gene (split on
+    ``combo_separator``) is present in ``gene_symbols_with_embeddings``.
+    Control cells carry no gene perturbation, so they are always kept. Cells
+    are dropped wholesale by perturbation label: if any constituent gene lacks
+    an embedding, every cell for that perturbation is removed.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Dataset to filter. Must contain a perturbation label column.
+    gene_symbols_with_embeddings : iterable of str
+        Gene symbols that have cached embeddings.
+    perturbation_col : str
+        ``obs`` column holding the perturbation label.
+    combo_separator : str
+        Separator used to join constituent genes in combinatorial labels.
+    control_label : str
+        Label for control (non-perturbed) cells.
+
+    Returns
+    -------
+    (adata, stats)
+        adata : AnnData
+            New AnnData with unsupported perturbations removed.
+        stats : dict
+            ``n_perts_before`` / ``n_perts_after`` / ``n_perts_dropped`` /
+            ``n_cells_dropped`` counts plus ``dropped_perturbations`` (a
+            sorted list of dropped perturbation labels).
+    """
+    genes_with_emb = set(gene_symbols_with_embeddings)
+    perts = adata.obs[perturbation_col].astype(str)
+    unique_before = set(perts.unique())
+
+    def _has_full_coverage(label: str) -> bool:
+        if label == control_label:
+            return True
+        return all(g in genes_with_emb for g in label.split(combo_separator))
+
+    keep = np.array([_has_full_coverage(p) for p in perts])
+    out = adata[keep].copy()
+
+    unique_after = set(out.obs[perturbation_col].astype(str).unique())
+    dropped = sorted(unique_before - unique_after)
+
+    stats = {
+        "n_perts_before": len(unique_before),
+        "n_perts_after": len(unique_after),
+        "n_perts_dropped": len(dropped),
+        "n_cells_dropped": int((~keep).sum()),
+        "dropped_perturbations": dropped,
+    }
+    return out, stats
+
+
 def normalize_total_log1p(
     adata: ad.AnnData,
     target_sum: float = 1e4,

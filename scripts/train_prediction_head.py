@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Train and evaluate the gene-embedding MLP prediction head.
+"""Train and evaluate the FiLM prediction head.
 
-Loads cached scGPT gene embeddings (from ``scripts/build_embeddings.py``),
-maps each perturbation to a summed gene embedding, and trains an MLP to
-predict the pseudobulk expression delta Δx over the same HVG gene set used
-by the baseline. There is no cell-state input — the model predicts
-perturbation effects from gene identity alone.
+Loads cached scGPT gene and cell embeddings (from
+``scripts/build_embeddings.py``), pairs every control cell embedding with each
+perturbation's summed gene embedding, and trains a FiLM-conditioned head to
+predict the pseudobulk expression delta Δx over the HVG gene set. The model
+outputs a mean ``mu`` and a ``log_variance`` per HVG, and is trained by
+maximizing the likelihood of the true Δx under the predicted normal
+distribution (a Gaussian negative log-likelihood loss).
 
-The split is **identical** to the one used by
-``scripts/train_baseline.py`` (same seed, same perturbation-level
-partition), and evaluation uses the **same** ``eval/prediction_metrics.py``
-functions (MSE, MAE, Pearson/Spearman, top-k).  Results are appended to
-the same ``results/metrics.csv`` so the two models are directly
-comparable.  A markdown comparison table (baseline vs. gene-embedding MLP)
-is printed at the end.
+The split is **identical** to the one used by ``scripts/train_baseline.py``
+(same seed, same perturbation-level partition), and evaluation uses the **same**
+``eval/prediction_metrics.py`` functions (MSE, MAE, Pearson/Spearman, top-k),
+with predictions averaged over all control cells for each perturbation.
+Results are appended to the same ``results/metrics.csv`` so the two models are
+directly comparable. A markdown comparison table (baseline vs. FiLM head) is
+printed at the end.
 
 Usage
 -----
@@ -35,8 +37,8 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 import torch
-import torch.nn as nn
 import yaml
+from torch.utils.data import DataLoader, Dataset
 
 try:
     import wandb
@@ -48,6 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from perturbgpt.data.splitting import (  # noqa: E402
+    CONTROL_LABEL,
     perturbation_split,
     persist_split,
 )
@@ -58,9 +61,14 @@ from perturbgpt.eval.prediction_metrics import (  # noqa: E402
     spearman_corr,
     top_k_recovery,
 )
-from perturbgpt.models.baseline import compute_pseudobulk_deltas  # noqa: E402
+from perturbgpt.models.baseline import (  # noqa: E402
+    compute_control_statistics,
+    compute_pseudobulk_deltas,
+    standardize_deltas,
+    unstandardize_predictions,
+)
 from perturbgpt.models.prediction_head import (  # noqa: E402
-    GeneMLP,
+    FiLMPredictionHead,
     compute_perturbation_embedding,
 )
 
@@ -96,6 +104,94 @@ def load_gene_embeddings(embeddings_dir: Path) -> tuple[dict[str, np.ndarray], i
     return gene_emb_map, int(gene_emb.shape[1])
 
 
+def load_cell_embeddings(embeddings_dir: Path) -> tuple[np.ndarray, list[str]]:
+    """Load cached scGPT cell embeddings from the NPZ file.
+
+    Returns
+    -------
+    cell_emb : np.ndarray
+        Float array of shape ``[n_cells, d_model]``.
+    cell_ids : list[str]
+        Cell barcode strings aligned to the rows of ``cell_emb``.
+    """
+    cell_path = embeddings_dir / "cell_embeddings.npz"
+    if not cell_path.exists():
+        raise FileNotFoundError(
+            f"Cached cell embeddings not found at {cell_path}. "
+            "Run scripts/build_embeddings.py first."
+        )
+
+    cell_npz = np.load(cell_path, allow_pickle=True)
+    cell_emb = cell_npz["embeddings"]
+    cell_ids = cell_npz["cell_ids"].astype(str)
+    return cell_emb, list(cell_ids)
+
+
+def gaussian_nll_loss(
+    mu: torch.Tensor,
+    log_var: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Gaussian negative log-likelihood of ``target`` under N(mu, exp(log_var)).
+
+    The constant ``0.5 * log(2 * pi)`` term is dropped because it does not
+    affect the gradient. ``log_var`` is the per-gene log-variance predicted by
+    the model.
+    """
+    var = log_var.exp()
+    return 0.5 * (log_var + (target - mu).pow(2) / var).mean()
+
+
+class ControlPertDataset(Dataset):
+    """Cartesian product of control-cell embeddings and perturbations.
+
+    Each ``(control_cell_i, perturbation_j)`` pair is one training sample whose
+    target is perturbation ``j``'s standardized pseudobulk delta (broadcast over
+    all control cells). ``__len__`` is ``n_ctrl * n_pert``.
+    """
+
+    def __init__(
+        self,
+        ctrl_embs: torch.Tensor,
+        pert_embs: torch.Tensor,
+        targets: torch.Tensor,
+    ):
+        self.ctrl_embs = ctrl_embs
+        self.pert_embs = pert_embs
+        self.targets = targets
+        self.n_ctrl = int(ctrl_embs.shape[0])
+        self.n_pert = int(pert_embs.shape[0])
+
+    def __len__(self) -> int:
+        return self.n_ctrl * self.n_pert
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        i, j = divmod(idx, self.n_pert)
+        return self.ctrl_embs[i], self.pert_embs[j], self.targets[j]
+
+
+def compute_split_loss(
+    model: FiLMPredictionHead,
+    ctrl_embs: torch.Tensor,
+    pert_embs: torch.Tensor,
+    targets: torch.Tensor,
+) -> float:
+    """Mean Gaussian NLL over all (control cell, perturbation) pairs."""
+    model.eval()
+    n_ctrl = int(ctrl_embs.shape[0])
+    total = 0.0
+    n_pairs = 0
+    with torch.no_grad():
+        for j in range(int(pert_embs.shape[0])):
+            ctrl_batch = ctrl_embs
+            pert_batch = pert_embs[j].unsqueeze(0).expand(n_ctrl, -1)
+            target_batch = targets[j].unsqueeze(0).expand(n_ctrl, -1)
+            mu, log_var = model(ctrl_batch, pert_batch)
+            total += float(gaussian_nll_loss(mu, log_var, target_batch)) * n_ctrl
+            n_pairs += n_ctrl
+    return total / n_pairs if n_pairs else float("inf")
+
+
 def append_results(
     path: Path,
     model_name: str,
@@ -125,14 +221,24 @@ def append_results(
 
 
 def evaluate(
-    model: GeneMLP,
+    model: FiLMPredictionHead,
+    ctrl_embs: torch.Tensor,
     deltas: dict[str, np.ndarray],
     gene_emb_map: dict[str, np.ndarray],
     d_model: int,
+    sigma: np.ndarray,
     device: torch.device,
     top_k: int,
 ) -> dict[str, float]:
-    """Evaluate model predictions against true pseudobulk deltas."""
+    """Evaluate model predictions against true pseudobulk deltas.
+
+    For each perturbation, the model is run on every control-cell embedding
+    paired with that perturbation's gene embedding, and the ``mu`` predictions
+    are averaged over control cells to give a single perturbation-level
+    prediction. Predictions and targets are un-standardized (multiplied by
+    ``sigma``) before metrics are computed so every metric is reported in the
+    original delta scale.
+    """
     model.eval()
     perts = sorted(deltas.keys())
     if not perts:
@@ -141,14 +247,22 @@ def evaluate(
             "top50_precision": 0.0, "top50_recall": 0.0,
         }
 
+    n_ctrl = int(ctrl_embs.shape[0])
     pert_feat = torch.tensor(
         np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in perts]),
         dtype=torch.float32, device=device,
     )
-    with torch.no_grad():
-        preds = model(pert_feat).cpu().numpy()
 
-    trues = np.stack([deltas[p] for p in perts])
+    mu_preds: list[np.ndarray] = []
+    with torch.no_grad():
+        for j in range(int(pert_feat.shape[0])):
+            ctrl_batch = ctrl_embs.to(device)
+            pert_batch = pert_feat[j].unsqueeze(0).expand(n_ctrl, -1)
+            mu, _log_var = model(ctrl_batch, pert_batch)
+            mu_preds.append(mu.mean(dim=0).cpu().numpy())
+
+    preds = unstandardize_predictions(np.stack(mu_preds), sigma)
+    trues = unstandardize_predictions(np.stack([deltas[p] for p in perts]), sigma)
     tk = top_k_recovery(preds, trues, k=top_k)
     return {
         "pearson": pearson_corr(preds, trues),
@@ -312,8 +426,11 @@ def main(argv=None) -> int:
         run_config = {
             "seed": seed,
             "pert_emb_dim": model_cfg["pert_emb_dim"],
+            "control_emb_dim": model_cfg.get("control_emb_dim", "auto"),
             "hidden_dim": model_cfg["hidden_dim"],
             "num_layers": model_cfg["num_layers"],
+            "film_hidden_dim": model_cfg.get("film_hidden_dim"),
+            "batch_size": model_cfg.get("batch_size", 256),
             "dropout": model_cfg["dropout"],
             "lr": model_cfg["lr"],
             "epochs": args.epochs or model_cfg["epochs"],
@@ -358,7 +475,7 @@ def main(argv=None) -> int:
     gene_emb_map, d_model = load_gene_embeddings(embeddings_dir)
     print(f"  {len(gene_emb_map)} gene embeddings, d_model={d_model}")
 
-    # Use cached d_model if the config left the emb dim unset or mismatched
+    # Use cached d_model if the config left the embedding dims unset/mismatched
     pert_emb_dim = model_cfg.get("pert_emb_dim", d_model)
     if pert_emb_dim != d_model:
         print(
@@ -367,6 +484,26 @@ def main(argv=None) -> int:
         )
         pert_emb_dim = d_model
 
+    control_emb_dim = model_cfg.get("control_emb_dim", d_model)
+    if control_emb_dim != d_model:
+        print(
+            f"  WARNING: config control_emb_dim ({control_emb_dim}) does not "
+            f"match cached d_model={d_model}; using cached d_model."
+        )
+        control_emb_dim = d_model
+
+    # Load cached cell embeddings and select the control cells used to
+    # condition the FiLM head. All control cells live in split.train.
+    print(f"Loading cached cell embeddings from {embeddings_dir} ...")
+    cell_emb, cell_ids = load_cell_embeddings(embeddings_dir)
+    cell_id_to_idx = {cid: i for i, cid in enumerate(cell_ids)}
+    ctrl_cells = sorted(
+        set(adata.obs_names[adata.obs["perturbation"].astype(str) == CONTROL_LABEL])
+    )
+    ctrl_idx = np.array([cell_id_to_idx[c] for c in ctrl_cells], dtype=np.int64)
+    ctrl_embs = torch.tensor(cell_emb[ctrl_idx], dtype=torch.float32, device=device)
+    print(f"  {ctrl_embs.shape[0]} control cells, control_emb_dim={control_emb_dim}")
+
     # 4. Compute pseudobulk deltas (identical to baseline)
     all_deltas = compute_pseudobulk_deltas(adata, split)
     train_deltas = {p: d for p, d in all_deltas.items() if p in split.train_perts}
@@ -374,81 +511,99 @@ def main(argv=None) -> int:
     test_deltas = {p: d for p, d in all_deltas.items() if p in split.test_perts}
     print(f"Deltas: train={len(train_deltas)} val={len(val_deltas)} test={len(test_deltas)}")
 
+    # Per-gene control statistics for target standardization.
+    ctrl_mu, ctrl_sigma = compute_control_statistics(adata, split)
+    train_deltas = standardize_deltas(train_deltas, ctrl_sigma)
+    val_deltas = standardize_deltas(val_deltas, ctrl_sigma)
+    test_deltas = standardize_deltas(test_deltas, ctrl_sigma)
+
     # 5. Build model
     n_hvgs = adata.n_vars
-    model = GeneMLP(
+    model = FiLMPredictionHead(
         pert_emb_dim=pert_emb_dim,
+        control_emb_dim=control_emb_dim,
         hidden_dim=model_cfg["hidden_dim"],
         num_layers=model_cfg["num_layers"],
         n_hvgs=n_hvgs,
         dropout=model_cfg["dropout"],
+        film_hidden_dim=model_cfg.get("film_hidden_dim"),
     ).to(device)
-    print(f"Model: GeneMLP(pert_emb_dim={pert_emb_dim}, "
-          f"hidden={model_cfg['hidden_dim']}, layers={model_cfg['num_layers']}, n_hvgs={n_hvgs})")
+    print(f"Model: FiLMPredictionHead(pert_emb_dim={pert_emb_dim}, "
+          f"control_emb_dim={control_emb_dim}, hidden={model_cfg['hidden_dim']}, "
+          f"layers={model_cfg['num_layers']}, n_hvgs={n_hvgs})")
 
-    # 6. Build training tensors (per-perturbation)
-    train_perts = sorted(train_deltas.keys())
-    train_pert = torch.tensor(
-        np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in train_perts]),
-        dtype=torch.float32, device=device,
-    )
-    train_targets = torch.tensor(
-        np.stack([train_deltas[p] for p in train_perts]),
-        dtype=torch.float32, device=device,
-    )
-    print(f"Training samples: {len(train_perts)} perturbations")
+    # 6. Build training tensors: control-cell x perturbation cartesian pairs.
+    def _make_split_tensors(
+        deltas: dict[str, np.ndarray],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        perts = sorted(deltas.keys())
+        pert_emb = torch.tensor(
+            np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model)
+                      for p in perts]),
+            dtype=torch.float32, device=device,
+        )
+        targets = torch.tensor(
+            np.stack([deltas[p] for p in perts]),
+            dtype=torch.float32, device=device,
+        )
+        return pert_emb, targets
+
+    train_pert_emb, train_targets = _make_split_tensors(train_deltas)
+    # for i,j in zip(train_pert_emb, train_targets):
+    #     print(f"train_pert_emb={i}, train_targets={j}")
+    val_pert_emb, val_targets = _make_split_tensors(val_deltas)
+
+    batch_size = model_cfg.get("batch_size", 256)
+    train_dataset = ControlPertDataset(ctrl_embs, train_pert_emb, train_targets)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    print(f"Training samples: {len(train_dataset)} "
+          f"(control cells x perturbations), batch_size={batch_size}")
 
     # 7. Training loop
     lr = model_cfg["lr"]
     epochs = args.epochs if args.epochs is not None else model_cfg["epochs"]
     weight_decay = model_cfg.get("weight_decay", 1e-5)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = nn.MSELoss()
 
     patience = model_cfg.get("patience", 10)
     top_k = model_cfg.get("top_k", 50)
     log_interval = wandb_cfg.get("log_interval", 1)
     full_val_interval = wandb_cfg.get("full_val_interval", 5)
 
-    # Precompute val evaluation tensors
-    val_perts_sorted = sorted(val_deltas.keys()) if val_deltas else []
-
     best_val_loss = float("inf")
     patience_counter = 0
 
     for epoch in range(epochs):
         model.train()
-        optimizer.zero_grad()
-        preds = model(train_pert)
-        loss = loss_fn(preds, train_targets)
-        loss.backward()
-        optimizer.step()
+        epoch_loss = 0.0
+        n_batches = 0
+        for ctrl_batch, pert_batch, target_batch in train_loader:
+            optimizer.zero_grad()
+            mu, log_var = model(ctrl_batch, pert_batch)
+            loss = gaussian_nll_loss(mu, log_var, target_batch)
+            # print(f"Epoch {epoch+1}")
+            # print(f"pert_batch={pert_batch[0]}")
+            # print(f"mu={mu[0].mean().item():.6f}, log_var={log_var[0].mean().item():.6f}, target={target_batch[0].mean().item():.6f}")
+            loss.backward()
+            optimizer.step()
+            epoch_loss += float(loss.item())
+            n_batches += 1
+        train_loss = epoch_loss / n_batches if n_batches else 0.0
 
-        # Evaluate val loss every epoch
-        model.eval()
+        # Evaluate val loss every epoch (mean NLL over all control-cell pairs)
         val_loss = float("inf")
-        if val_perts_sorted:
-            with torch.no_grad():
-                vp = torch.tensor(
-                    np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model)
-                              for p in val_perts_sorted]),
-                    dtype=torch.float32, device=device,
-                )
-                vt = torch.tensor(
-                    np.stack([val_deltas[p] for p in val_perts_sorted]),
-                    dtype=torch.float32, device=device,
-                )
-                val_loss = float(loss_fn(model(vp), vt))
+        if val_pert_emb.shape[0]:
+            val_loss = compute_split_loss(model, ctrl_embs, val_pert_emb, val_targets)
 
         if (epoch + 1) % log_interval == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}/{epochs}  train_loss={loss.item():.6f}  val_loss={val_loss:.6f}")
+            print(f"Epoch {epoch+1:3d}/{epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}")
             if use_wandb:
-                wandb.log({"epoch": epoch + 1, "train_loss": loss.item(), "val_loss": val_loss})
+                wandb.log({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
 
         # Full val metrics every full_val_interval
-        if val_perts_sorted and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
+        if val_pert_emb.shape[0] and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
             val_metrics = evaluate(
-                model, val_deltas, gene_emb_map, d_model, device, top_k,
+                model, ctrl_embs, val_deltas, gene_emb_map, d_model, ctrl_sigma, device, top_k,
             )
             if use_wandb:
                 wandb.log({f"val/{k}": v for k, v in val_metrics.items()})
@@ -472,7 +627,7 @@ def main(argv=None) -> int:
         if not deltas:
             print(f"No perturbations in {split_name} split, skipping.")
             continue
-        metrics = evaluate(model, deltas, gene_emb_map, d_model, device, top_k)
+        metrics = evaluate(model, ctrl_embs, deltas, gene_emb_map, d_model, ctrl_sigma, device, top_k)
         print(f"\n=== {split_name} metrics ===")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")

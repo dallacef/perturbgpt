@@ -54,7 +54,10 @@ from perturbgpt.models.baseline import (  # noqa: E402
     UNKNOWN_IDX,
     BaselineModel,
     build_pert_to_idx,
+    compute_control_statistics,
     compute_pseudobulk_deltas,
+    standardize_deltas,
+    unstandardize_predictions,
 )
 
 
@@ -67,10 +70,16 @@ def evaluate(
     model: BaselineModel,
     deltas: dict[str, np.ndarray],
     pert_to_idx: dict[str, int],
+    sigma: np.ndarray,
     device: torch.device,
     top_k: int,
 ) -> dict[str, float]:
-    """Evaluate model predictions against true pseudobulk deltas."""
+    """Evaluate model predictions against true pseudobulk deltas.
+
+    ``deltas`` are standardized; predictions and targets are un-standardized
+    (multiplied by ``sigma``) before metrics are computed so every metric is
+    reported in the original delta scale.
+    """
     model.eval()
     perts = sorted(deltas.keys())
     if not perts:
@@ -85,7 +94,8 @@ def evaluate(
     with torch.no_grad():
         preds = model(indices).cpu().numpy()
 
-    trues = np.stack([deltas[p] for p in perts])
+    preds = unstandardize_predictions(preds, sigma)
+    trues = unstandardize_predictions(np.stack([deltas[p] for p in perts]), sigma)
     tk = top_k_recovery(preds, trues, k=top_k)
     return {
         "pearson": pearson_corr(preds, trues),
@@ -284,6 +294,12 @@ def main(argv=None) -> int:
     test_deltas = {p: d for p, d in all_deltas.items() if p in split.test_perts}
     print(f"Deltas: train={len(train_deltas)} val={len(val_deltas)} test={len(test_deltas)}")
 
+    # Per-gene control statistics for target standardization.
+    ctrl_mu, ctrl_sigma = compute_control_statistics(adata, split)
+    train_deltas = standardize_deltas(train_deltas, ctrl_sigma)
+    val_deltas = standardize_deltas(val_deltas, ctrl_sigma)
+    test_deltas = standardize_deltas(test_deltas, ctrl_sigma)
+
     # 4. Build pert-to-idx and model
     pert_to_idx = build_pert_to_idx(split.train_perts)
     n_hvgs = adata.n_vars
@@ -355,7 +371,10 @@ def main(argv=None) -> int:
         if val_perts_sorted and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
             with torch.no_grad():
                 val_preds_np = model(val_indices).cpu().numpy()
-            val_trues_np = np.stack([val_deltas[p] for p in val_perts_sorted])
+            val_preds_np = unstandardize_predictions(val_preds_np, ctrl_sigma)
+            val_trues_np = unstandardize_predictions(
+                np.stack([val_deltas[p] for p in val_perts_sorted]), ctrl_sigma,
+            )
             val_metrics = {
                 "val/pearson": pearson_corr(val_preds_np, val_trues_np),
                 "val/spearman": spearman_corr(val_preds_np, val_trues_np),
@@ -386,7 +405,7 @@ def main(argv=None) -> int:
         if not deltas:
             print(f"No perturbations in {split_name} split, skipping.")
             continue
-        metrics = evaluate(model, deltas, pert_to_idx, device, top_k)
+        metrics = evaluate(model, deltas, pert_to_idx, ctrl_sigma, device, top_k)
         print(f"\n=== {split_name} metrics ===")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")

@@ -13,6 +13,7 @@ dataset:
   guide_identities_url: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE133nnn/GSE133344/suppl/GSE133344_filtered_cell_identities.csv.gz
   guide_identities_file: data/raw/GSE133344_filtered_cell_identities.csv.gz
   processed_file: data/processed/perturbseq.h5ad
+  gene_embeddings_file: data/embeddings/gene_embeddings.npz
 schema:
   perturbation_col: perturbation
   guide_id_col: guide_id
@@ -34,4 +35,4 @@ preprocessing:
   good_coverage_column: good_coverage
   target_sum: 10000.0
   log1p: false
-  n_top_hvgs: 3000
+  n_top_hvgs: 250
