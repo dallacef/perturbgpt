@@ -22,13 +22,13 @@ prediction_head:
   control_emb_dim: 512
   hidden_dim: 256
   num_layers: 3
-  film_hidden_dim: null        # null = reuse hidden_dim
+  film_hidden_dim: 128        # null = reuse hidden_dim
   dropout: 0.1
   batch_size: 256              # (control cell, perturbation) pairs per batch
   lr: 1.0e-3
   weight_decay: 1.0e-5
   epochs: 100
   early_stopping: true
-  patience: 15
+  patience: 20
   top_k: 50
 

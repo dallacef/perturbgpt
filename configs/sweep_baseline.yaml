@@ -24,7 +24,6 @@ parameters:
     distribution: uniform
     min: 0.0
     max: 0.3
-  pca_variance:
-    distribution: uniform
-    min: 0.90
-    max: 0.99
+  # NOTE: the baseline no longer uses PCA/cell-state features, so there is no
+  # pca_variance parameter to sweep.  Valid keys are the model.yaml
+  # `baseline` hyperparameters above.

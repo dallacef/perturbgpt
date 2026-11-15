@@ -11,14 +11,13 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 from perturbgpt.agent.prompts import SYSTEM_PROMPT
 from perturbgpt.agent.tools import (
-    get_predicted_genes,
     find_similar_perturbations,
     get_pathways,
+    get_predicted_genes,
     retrieve_literature,
 )
 

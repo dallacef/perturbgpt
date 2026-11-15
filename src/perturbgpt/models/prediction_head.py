@@ -16,12 +16,16 @@ Two prediction heads are provided:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence, Union
+
 import numpy as np
 import torch
 import torch.nn as nn
 
 from perturbgpt.data.splitting import parse_perturbation
-
 
 # --------------------------------------------------------- prediction head
 
@@ -81,7 +85,7 @@ class GeneMLP(nn.Module):
             Predicted expression delta.
         """
         return self.mlp(pert_emb)
-        
+
 
 
 # --------------------------------------------------------- FiLM prediction head
@@ -285,3 +289,306 @@ def compute_perturbation_embedding(
         if g in gene_emb_map:
             emb = emb + gene_emb_map[g]
     return emb
+
+# --------------------------------------------------------- checkpoint I/O
+
+#: Current on-disk checkpoint schema version (see :func:`save_prediction_checkpoint`).
+CHECKPOINT_FORMAT_VERSION = 1
+
+#: Architecture tags understood by :func:`load_prediction_checkpoint`.
+ARCH_FILM = "film"
+ARCH_GENE_MLP = "gene_mlp"
+
+
+@dataclass
+class PredictionBundle:
+    """A loaded prediction head plus everything inference needs.
+
+    Attributes
+    ----------
+    arch : str
+        ``"film"`` (control-cell conditioned) or ``"gene_mlp"``
+        (perturbation-embedding only).
+    model : torch.nn.Module
+        The model, already in ``eval()`` mode on *device*.
+    model_config : dict
+        Architecture hyper-parameters, including ``n_hvgs``.
+    gene_names : list[str]
+        Output gene symbols aligned with the model's ``n_hvgs`` outputs.
+    control_emb_mean : np.ndarray or None
+        Mean control-cell embedding ``[control_emb_dim]``.  Required for
+        ``"film"`` models, ``None`` for ``"gene_mlp"`` models.
+    device : torch.device
+        Device the model lives on.
+    """
+
+    arch: str
+    model: nn.Module
+    model_config: dict
+    gene_names: list[str]
+    control_emb_mean: np.ndarray | None
+    device: "torch.device"
+
+    @property
+    def n_hvgs(self) -> int:
+        return int(self.model_config.get("n_hvgs", len(self.gene_names)))
+
+    def predict_delta(
+        self,
+        pert_labels: Sequence[str],
+        gene_emb_map: dict[str, np.ndarray],
+    ) -> np.ndarray:
+        """Predict pseudobulk expression deltas for a batch of perturbations.
+
+        Parameters
+        ----------
+        pert_labels : sequence of str
+            Perturbation labels, e.g. ``["KLF1", "AHR_KLF1"]``.
+        gene_emb_map : dict[str, np.ndarray]
+            Gene symbol -> frozen scGPT gene embedding.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``[len(pert_labels), n_hvgs]``, dtype ``float32``.
+            Row *i* is the predicted delta for ``pert_labels[i]``.
+        """
+        labels = [str(p) for p in pert_labels]
+        if not labels:
+            return np.zeros((0, self.n_hvgs), dtype=np.float32)
+
+        emb_dim = int(self.model_config.get("pert_emb_dim", 512))
+        feats = np.stack(
+            [compute_perturbation_embedding(p, gene_emb_map, emb_dim) for p in labels]
+        )
+        pert = torch.tensor(feats, dtype=torch.float32, device=self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            if self.arch == ARCH_FILM:
+                if self.control_emb_mean is None:
+                    raise ValueError(
+                        "FiLM prediction bundle has no control_emb_mean; "
+                        "cannot run inference without a control-cell embedding."
+                    )
+                control = torch.tensor(
+                    np.tile(
+                        np.asarray(self.control_emb_mean, dtype=np.float32),
+                        (len(labels), 1),
+                    ),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                mu, _log_var = self.model(control, pert)
+                preds = mu
+            else:
+                preds = self.model(pert)
+
+        return preds.detach().cpu().numpy().astype(np.float32)
+
+
+def save_prediction_checkpoint(
+    path: Union[str, Path],
+    model: nn.Module,
+    *,
+    arch: str,
+    model_config: dict,
+    gene_names: Sequence[str],
+    control_emb_mean: np.ndarray | None = None,
+) -> Path:
+    """Serialize a trained prediction head to an inference-ready checkpoint.
+
+    The checkpoint is a plain dict so that ``torch.load(...)["model_config"]``
+    / ``["model_state_dict"]`` / ``["gene_names"]`` work without importing
+    this module first::
+
+        {
+          "format_version": 1,
+          "arch": "film" | "gene_mlp",
+          "model_config": {...},
+          "model_state_dict": {...},
+          "gene_names": [...],
+          "control_emb_mean": np.ndarray,   # FiLM only
+          "created": "<ISO-8601 UTC timestamp>",
+        }
+
+    Parameters
+    ----------
+    path : str or Path
+        Destination file, e.g. ``runs/film_head.pt``.  Parent directories are
+        created as needed.
+    model : torch.nn.Module
+        Trained model.
+    arch : str
+        ``"film"`` or ``"gene_mlp"``.
+    model_config : dict
+        Architecture hyper-parameters.  ``n_hvgs`` is filled in from
+        *gene_names* when absent.
+    gene_names : sequence of str
+        Output gene symbols, in model output order.
+    control_emb_mean : np.ndarray, optional
+        Required for ``arch="film"``: the mean control-cell embedding used
+        as the FiLM backbone input at inference time.
+
+    Returns
+    -------
+    Path
+        The written checkpoint path.
+
+    Raises
+    ------
+    ValueError
+        If *arch* is unknown, if a FiLM checkpoint lacks *control_emb_mean*,
+        or if ``n_hvgs`` and ``len(gene_names)`` disagree.
+    """
+    if arch not in (ARCH_FILM, ARCH_GENE_MLP):
+        raise ValueError(
+            f"Unknown architecture {arch!r}; expected one of "
+            f"{ARCH_FILM!r} or {ARCH_GENE_MLP!r}."
+        )
+
+    gene_names = [str(g) for g in gene_names]
+    config = dict(model_config)
+    config.setdefault("n_hvgs", len(gene_names))
+    config["n_hvgs"] = int(config["n_hvgs"])
+    if gene_names and config["n_hvgs"] != len(gene_names):
+        raise ValueError(
+            f"n_hvgs ({config['n_hvgs']}) does not match len(gene_names) "
+            f"({len(gene_names)}); the gene names must align with the outputs."
+        )
+    if arch == ARCH_FILM and control_emb_mean is None:
+        raise ValueError(
+            "FiLM checkpoints require control_emb_mean so that inference can "
+            "run without re-loading per-cell embeddings."
+        )
+
+    payload: dict = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "arch": arch,
+        "model_config": config,
+        "model_state_dict": {
+            k: v.detach().cpu() for k, v in model.state_dict().items()
+        },
+        "gene_names": gene_names,
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
+    if control_emb_mean is not None:
+        payload["control_emb_mean"] = np.asarray(
+            control_emb_mean, dtype=np.float32
+        ).ravel()
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    return path
+
+
+def read_checkpoint_arch(path: Union[str, Path]) -> str:
+    """Return the architecture tag of a checkpoint without building the model.
+
+    Checkpoints written before this helper existed have no ``arch`` key and
+    are treated as ``"gene_mlp"`` for backwards compatibility.
+    """
+    ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"{path} is not a prediction-head checkpoint.")
+    cfg = ckpt.get("model_config") or {}
+    return str(ckpt.get("arch") or cfg.get("arch") or ARCH_GENE_MLP)
+
+
+def load_prediction_checkpoint(
+    path: Union[str, Path],
+    device: str = "cpu",
+) -> PredictionBundle:
+    """Load a checkpoint written by :func:`save_prediction_checkpoint`.
+
+    Both architectures are supported and dispatched on the ``arch`` tag, so
+    callers (agent tools, retrieval-index builder, API) share one code path.
+
+    Parameters
+    ----------
+    path : str or Path
+        Checkpoint file.
+    device : str
+        Torch device string, e.g. ``"cpu"``.
+
+    Returns
+    -------
+    PredictionBundle
+        Model in ``eval()`` mode plus its config, gene names and (for FiLM)
+        the mean control embedding.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* does not exist.
+    ValueError
+        If the file is not a prediction-head checkpoint, the architecture is
+        unknown, or required fields are missing/inconsistent.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Prediction checkpoint not found: {path}")
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+        raise ValueError(
+            f"{path} is not a prediction-head checkpoint "
+            "(missing 'model_state_dict')."
+        )
+
+    cfg = dict(ckpt.get("model_config") or {})
+    arch = str(ckpt.get("arch") or cfg.get("arch") or ARCH_GENE_MLP)
+    gene_names = [str(g) for g in (ckpt.get("gene_names") or cfg.get("gene_names") or [])]
+    n_hvgs = int(cfg.get("n_hvgs") or len(gene_names))
+    if n_hvgs <= 0:
+        raise ValueError(f"{path}: cannot determine n_hvgs (no config, no gene_names).")
+    if gene_names and len(gene_names) != n_hvgs:
+        raise ValueError(
+            f"{path}: len(gene_names)={len(gene_names)} != n_hvgs={n_hvgs}."
+        )
+    cfg["n_hvgs"] = n_hvgs
+
+    control_emb_mean: np.ndarray | None = None
+    if arch == ARCH_FILM:
+        raw_mean = ckpt.get("control_emb_mean")
+        if raw_mean is None:
+            raise ValueError(
+                f"{path}: FiLM checkpoint is missing 'control_emb_mean'."
+            )
+        control_emb_mean = np.asarray(raw_mean, dtype=np.float32).ravel()
+        model: nn.Module = FiLMPredictionHead(
+            pert_emb_dim=int(cfg.get("pert_emb_dim", 512)),
+            control_emb_dim=int(cfg.get("control_emb_dim", control_emb_mean.shape[0])),
+            hidden_dim=int(cfg.get("hidden_dim", 256)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            n_hvgs=n_hvgs,
+            dropout=0.0,  # inference: no stochasticity
+            film_hidden_dim=cfg.get("film_hidden_dim"),
+        )
+    elif arch == ARCH_GENE_MLP:
+        model = GeneMLP(
+            pert_emb_dim=int(cfg.get("pert_emb_dim", 512)),
+            hidden_dim=int(cfg.get("hidden_dim", 256)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            n_hvgs=n_hvgs,
+            dropout=0.0,
+        )
+    else:
+        raise ValueError(
+            f"{path}: unknown architecture {arch!r}; expected "
+            f"{ARCH_FILM!r} or {ARCH_GENE_MLP!r}."
+        )
+
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    return PredictionBundle(
+        arch=arch,
+        model=model,
+        model_config=cfg,
+        gene_names=gene_names,
+        control_emb_mean=control_emb_mean,
+        device=torch.device(device),
+    )

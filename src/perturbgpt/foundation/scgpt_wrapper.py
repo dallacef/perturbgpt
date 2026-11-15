@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Sequence, Union
 
 import anndata as ad
 import numpy as np
@@ -105,7 +105,7 @@ class ScGPTWrapper:
         import torch
         from scgpt.model import TransformerModel
         from scgpt.tokenizer.gene_tokenizer import GeneVocab
-        from scgpt.utils import set_seed, load_pretrained
+        from scgpt.utils import load_pretrained, set_seed
 
 
         set_seed(seed)
@@ -197,12 +197,13 @@ class ScGPTWrapper:
         This is deliberately *separate* from the baseline
         ``perturbgpt.data.preprocessing`` pipeline.
 
-        Returns a new AnnData with ``.layers["X_binned"]`` containing the
-        binned expression matrix.
+        Returns the preprocessed AnnData with ``.layers["X_binned"]``
+        containing the binned expression matrix.  scGPT's own
+        ``Preprocessor`` mutates its argument in place and returns
+        ``None``; lightweight test doubles instead return a new object.
         """
         from scgpt.preprocess import Preprocessor
 
-        print(adata.X.toarray()[0:5, 0:5])
         preprocessor = Preprocessor(
             use_key=None,
             filter_gene_by_counts=False,
@@ -217,8 +218,8 @@ class ScGPTWrapper:
             binning=self.n_bins,
             result_binned_key="X_binned",
         )
-        preprocessor(adata)
-        return adata
+        processed = preprocessor(adata)
+        return adata if processed is None else processed
 
     def _match_vocabulary(
         self, adata: ad.AnnData
@@ -252,7 +253,6 @@ class ScGPTWrapper:
             len(matched),
             len(var_names),
         )
-        return np.array(matched, dtype=np.int64), np.array(indices, dtype=np.int64)
         return np.array(matched, dtype=np.int64), np.array(indices, dtype=np.int64)
 
     # ------------------------------------------------------ cell embeddings

@@ -63,7 +63,7 @@ def main(argv=None) -> int:
 
     print(f"Creating sweep in project '{args.project}'...")
     sweep_id = wandb.sweep(sweep_config, project=args.project, entity=args.entity)
-    print(f"Sweep created successfully!")
+    print("Sweep created successfully!")
     print(f"  Sweep ID:  {sweep_id}")
     print(f"  Project:   {args.project}")
     entity_str = args.entity or wandb.Api().default_entity

@@ -32,8 +32,8 @@ import numpy as np  # noqa: E402
 from perturbgpt.data import preprocessing as pp  # noqa: E402
 from perturbgpt.data.loading import load_config, load_dataset  # noqa: E402
 from perturbgpt.data.splitting import (  # noqa: E402
-    perturbation_split,
     persist_split,
+    perturbation_split,
 )
 
 

@@ -40,8 +40,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from perturbgpt.data.splitting import (  # noqa: E402
-    perturbation_split,
     persist_split,
+    perturbation_split,
 )
 from perturbgpt.eval.prediction_metrics import (  # noqa: E402
     mae,
@@ -130,10 +130,6 @@ def append_results(
         if write_header:
             writer.writeheader()
         writer.writerow(row)
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 def parse_hparam_overrides(unknown_args: list[str], model_cfg: dict) -> dict:
@@ -189,10 +185,6 @@ def parse_hparam_overrides(unknown_args: list[str], model_cfg: dict) -> dict:
     return overrides
 
 
-
-
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-config", default=str(PROJECT_ROOT / "configs" / "model.yaml"))
@@ -230,7 +222,6 @@ def main(argv=None) -> int:
     import os
     _under_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
     use_wandb = args.use_wandb or wandb_cfg.get("enabled", False) or _under_sweep
-    wandb_run = None
     if use_wandb:
         if not _WANDB_AVAILABLE:
             print("WARNING: --use-wandb requested but wandb not installed; skipping.")
@@ -251,7 +242,7 @@ def main(argv=None) -> int:
                 "val_frac": train_cfg["splitting"]["perturbation_split"]["val_frac"],
                 "test_frac": train_cfg["splitting"]["perturbation_split"]["test_frac"],
             }
-            wandb_run = wandb.init(
+            wandb.init(
                 project=args.wandb_project or wandb_cfg.get("project", "perturbgpt-baseline"),
                 entity=wandb_cfg.get("entity"),
                 name=args.wandb_run_name or wandb_cfg.get("run_name"),

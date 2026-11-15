@@ -15,16 +15,24 @@ found" from "weak evidence".
 
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Union
 
 import numpy as np
 
 from perturbgpt.rag.pubmed_ingest import PubMedRecord, load_stored_abstracts
-from perturbgpt.retrieval.index import l2_normalize, _FAISS_AVAILABLE, _require_faiss
+from perturbgpt.retrieval.index import _FAISS_AVAILABLE, _require_faiss
 
 DEFAULT_MODEL = "all-MiniLM-L6-v2"
-DEFAULT_RELEVANCE_THRESHOLD = 0.15  # cosine similarity cutoff for "relevant"
+#: Cosine-similarity cutoff below which a hit is treated as "no evidence".
+#: Calibrated on the bundled PubMed corpus: off-topic / gibberish queries
+#: peak at ~0.14-0.15, single gene symbols at ~0.19, and contextual
+#: biology queries (e.g. "KLF1 erythroid differentiation") at ~0.30-0.45.
+#: 0.20 keeps contextual matches while suppressing unrelated abstracts,
+#: which is what makes the agent's no-evidence rule trustworthy.
+DEFAULT_RELEVANCE_THRESHOLD = 0.20
 
 
 def _require_sentence_transformers():
@@ -64,6 +72,7 @@ class LiteratureIndex:
         SentenceTransformer = _require_sentence_transformers()
 
         self.records = records
+        self.model_name = model_name
         self.relevance_threshold = relevance_threshold
         self.model = SentenceTransformer(model_name)
 
@@ -116,6 +125,63 @@ class LiteratureIndex:
                 "year": rec.year,
             })
         return results
+
+    # ----- save / load
+
+    def save(self, path: Union[str, Path]) -> Path:
+        """Persist the FAISS index and abstract metadata to a directory.
+
+        Writes::
+
+            {path}/literature.faiss   serialised FAISS IndexFlatIP
+            {path}/literature.json    records + model name + threshold
+
+        Returns the FAISS file path.
+        """
+        faiss = _require_faiss()
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        faiss_path = path / "literature.faiss"
+        faiss.write_index(self._index, str(faiss_path))
+        payload = {
+            "model_name": self.model_name,
+            "relevance_threshold": float(self.relevance_threshold),
+            "dim": int(self._dim),
+            "records": [asdict(r) for r in self.records],
+        }
+        with (path / "literature.json").open("w") as fh:
+            json.dump(payload, fh, indent=2)
+        return faiss_path
+
+    @classmethod
+    def load(
+        cls,
+        path: Union[str, Path],
+        model_name: str | None = None,
+    ) -> "LiteratureIndex":
+        """Load an index previously written by :meth:`save`.
+
+        The sentence-embedding model is re-instantiated (it is needed to
+        encode queries) but the abstracts are **not** re-encoded.
+        """
+        faiss = _require_faiss()
+        SentenceTransformer = _require_sentence_transformers()
+        path = Path(path)
+
+        with (path / "literature.json").open() as fh:
+            payload = json.load(fh)
+
+        obj = cls.__new__(cls)
+        obj.records = [PubMedRecord(**r) for r in payload["records"]]
+        obj.model_name = model_name or payload["model_name"]
+        obj.relevance_threshold = float(payload["relevance_threshold"])
+        obj.model = SentenceTransformer(obj.model_name)
+        obj._dim = int(payload["dim"])
+        obj._index = faiss.read_index(str(path / "literature.faiss"))
+        obj._normed = faiss.rev_swig_ptr(
+            obj._index.get_xb(), obj._index.ntotal * obj._index.d
+        ).reshape(obj._index.ntotal, obj._index.d).astype(np.float32)
+        return obj
 
 
 def build_literature_index(

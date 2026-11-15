@@ -11,6 +11,9 @@ helpers (l2_normalize, metrics, co-membership) always run.
 
 from __future__ import annotations
 
+import json
+import sys
+
 import numpy as np
 import pytest
 
@@ -164,15 +167,46 @@ def test_mrr_empty_relevant():
 # ================================================== pathway / co-membership
 
 
-def test_pathway_stub_returns_empty():
+@pytest.fixture()
+def patched_pathway_cache(tmp_path, monkeypatch):
+    """Point the pathway loader at a tiny known Hallmark-style cache."""
+    from perturbgpt.eval import pathway_metrics as pm
+
+    cache = tmp_path / "msigdb_hallmark.json"
+    cache.write_text(json.dumps({
+        "HALLMARK_ERYTHROID": ["KLF1", "GATA1", "HBB"],
+        "HALLMARK_HYPOXIA": ["HIF1A", "VEGFA"],
+    }))
+    monkeypatch.setattr(pm, "DEFAULT_CACHE", cache)
+    return cache
+
+
+def test_pathway_memberships_inverts_gene_sets(patched_pathway_cache):
+    memberships = get_pathway_memberships()
+    assert memberships["KLF1"] == {"HALLMARK_ERYTHROID"}
+    assert memberships["GATA1"] == {"HALLMARK_ERYTHROID"}
+    assert memberships["HIF1A"] == {"HALLMARK_HYPOXIA"}
+
+
+def test_pathway_memberships_explicit_cache_path(patched_pathway_cache):
+    memberships = get_pathway_memberships(cache_path=patched_pathway_cache)
+    assert "HBB" in memberships
+
+
+def test_pathway_memberships_missing_cache_returns_empty(tmp_path, monkeypatch):
+    from perturbgpt.eval import pathway_metrics as pm
+
+    monkeypatch.setattr(pm, "DEFAULT_CACHE", tmp_path / "missing.json")
+    monkeypatch.setitem(sys.modules, "gseapy", None)
     assert get_pathway_memberships() == {}
 
 
-def test_co_membership_stub_all_empty():
-    perts = ["KLF1", "AHR", "CEBPA"]
+def test_co_membership_from_real_pathway_cache(patched_pathway_cache):
+    perts = ["KLF1", "GATA1", "HIF1A"]
     gt = build_pathway_co_membership(perts)
-    for p in perts:
-        assert gt[p] == set()
+    assert gt["KLF1"] == {"GATA1"}
+    assert gt["GATA1"] == {"KLF1"}
+    assert gt["HIF1A"] == set()
 
 
 def test_co_membership_with_injected_pathways():

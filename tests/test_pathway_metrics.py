@@ -14,7 +14,6 @@ import pytest
 
 from perturbgpt.eval import pathway_metrics as pm
 
-
 # ── synthetic gene sets for offline testing ──────────────────────────
 
 SYNTHETIC_GENE_SETS = {
@@ -189,3 +188,43 @@ def test_get_pathways_tool(patched_gene_sets, monkeypatch):
     assert "p_adj" in result[0]
     assert "genes" in result[0]
 
+
+# ── builder script (offline path) ────────────────────────────────────
+
+
+def test_build_pathway_sets_script_builtin(tmp_path):
+    """`build_pathway_sets.py --source builtin` writes the loader's schema."""
+    import json as _json
+    import subprocess
+    import sys as _sys
+
+    from perturbgpt.eval import pathway_metrics as pm
+
+    root = Path(pm.__file__).resolve().parents[3]
+    out = tmp_path / "msigdb_hallmark.json"
+    result = subprocess.run(
+        [
+            _sys.executable,
+            str(root / "scripts" / "build_pathway_sets.py"),
+            "--source", "builtin",
+            "--output", str(out),
+            "--data", str(tmp_path / "absent.h5ad"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=root,
+    )
+    assert result.returncode == 0, result.stderr
+
+    gene_sets = _json.loads(out.read_text())
+    assert "HALLMARK_ERYTHROID" in gene_sets
+    assert "KLF1" in gene_sets["HALLMARK_ERYTHROID"]
+    assert all(isinstance(v, list) and v for v in gene_sets.values())
+
+    meta = _json.loads((tmp_path / "msigdb_hallmark.json.meta.json").read_text())
+    assert meta["source"] == "builtin"
+    assert meta["n_pathways"] == len(gene_sets)
+
+    # The generated file must satisfy the production loader unchanged.
+    loaded = pm.load_gene_sets(cache_path=out)
+    assert loaded["HALLMARK_ERYTHROID"] >= {"KLF1", "GATA1", "HBB"}

@@ -111,7 +111,11 @@ def main(argv=None) -> int:
 
     # ---- gene embeddings ------------------------------------------------------
     print("Extracting gene embeddings ...")
-    gene_symbols = sorted(adata.var_names.tolist())
+    # Load all genes from scGPT vocabulary (not just HVGs)
+    vocab_path = Path(args.model_dir) / "vocab.json"
+    with vocab_path.open() as fh:
+        vocab_dict = json.load(fh)
+    gene_symbols = sorted(vocab_dict.keys())
     gene_emb_list = []
     matched_genes = []
     for gs in gene_symbols:

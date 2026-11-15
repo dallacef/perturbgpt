@@ -9,7 +9,6 @@ run fast and without GPU or network access.
 from __future__ import annotations
 
 import json
-import sys
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -155,7 +154,12 @@ class MockTransformerModel:
         MVC=False,
         ECS=False,
     ):
-        """Deterministic forward pass returning [batch, seq_len, d_model]."""
+        """Deterministic forward pass.
+
+        Mirrors scGPT's ``TransformerModel`` contract: a dict whose
+        ``cell_emb`` entry is the ``<cls>`` token hidden state, shape
+        ``[batch, d_model]`` (position 0 carries the CLS token).
+        """
         batch_size = gene_ids.shape[0]
         seq_len = gene_ids.shape[1]
         d = self._d_model
@@ -163,7 +167,7 @@ class MockTransformerModel:
         rng = np.random.default_rng(123)
         base = rng.standard_normal((seq_len, d)).astype(np.float32)
         output_np = np.tile(base[np.newaxis, :, :], (batch_size, 1, 1))
-        return _MockTensor(output_np)
+        return {"cell_emb": _MockTensor(output_np[:, 0, :])}
 
 
 # ------------------------------------------------------------- mock preprocessor

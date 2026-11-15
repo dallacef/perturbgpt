@@ -4,8 +4,9 @@
 The ablation suite compares four progressively more capable variants against
 the same perturbation-level split:
 
-1. **baseline**   — PCA-reduced control expression + learned perturbation
-                    embedding through an MLP (``scripts/train_baseline.py``).
+1. **baseline**   — a learned perturbation embedding (no cell-state or
+                    expression features) through an MLP
+                    (``scripts/train_baseline.py``).
 2. **film_head**  — FiLM-conditioned MLP over frozen scGPT cell/gene
                     embeddings (``scripts/train_prediction_head.py``).
 3. **+retrieval** — FiLM head + FAISS perturbation/response retrieval
@@ -17,10 +18,12 @@ the same perturbation-level split:
 Prediction metrics (MSE, MAE, Pearson, Spearman, top-k) are read from
 ``results/metrics.csv`` for the baseline and FiLM head. Retrieval metrics
 (Recall@K, Precision@K, MRR) are read from
-``data/indices/retrieval_results.json``. Agent-level metrics (citation
-grounding rate, citation validity, no-evidence fallback correctness) are
-computed by running the orchestrator against scripted mock-LLM probes, so
-no live LLM or model checkpoint is required.
+``data/indices/retrieval_results.json``. Agent-level metrics (citation grounding rate, citation validity,
+no-evidence fallback correctness) come in two flavours: ``probes``
+(scripted mock-LLM/mock-tool probes that always run and need no model,
+index, or network — used by CI) and ``full_agent`` (the real tool-calling
+agent executed on a few test-split perturbations with ``--full-agent``).
+The default ``--llm-provider deterministic`` planner needs no API key.
 
 Usage
 -----
@@ -29,6 +32,9 @@ Usage
 
     # Re-run every training/evaluation stage first, then compare:
     python scripts/run_ablations.py --run-all
+
+    # Execute the real agent on test perturbations (no API key needed):
+    python scripts/run_ablations.py --full-agent --agent-perts 3
 
     # Re-run individual stages:
     python scripts/run_ablations.py --run-baseline
@@ -55,7 +61,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from perturbgpt.agent.orchestrator import run  # noqa: E402
+from perturbgpt.agent import tools as agent_tools  # noqa: E402
+from perturbgpt.agent.llm import make_llm_fn  # noqa: E402
+from perturbgpt.agent.orchestrator import TOOLS, run  # noqa: E402
 from perturbgpt.eval import agent_eval  # noqa: E402
 
 #: Model names written to ``results/metrics.csv`` by each training script.
@@ -249,6 +257,96 @@ def run_agent_eval_probes() -> dict[str, float]:
     }
 
 
+def _test_perturbations(n: int) -> list[str]:
+    """Return up to *n* test-split perturbation labels."""
+    split_path = PROJECT_ROOT / "data" / "processed" / "splits" / "perturbation_split.json"
+    perts: list[str] = []
+    if split_path.exists():
+        payload = json.loads(split_path.read_text())
+        perts = sorted(payload.get("test_perts", []))
+    if not perts:
+        index = agent_tools._ensure_index("perturbation")
+        perts = sorted(index.ids) if index is not None else []
+    return perts[: max(int(n), 0)]
+
+
+def run_full_agent_eval(
+    n_perts: int = 3,
+    llm_provider: str = "deterministic",
+    llm_model: str | None = None,
+) -> dict[str, float]:
+    """Run the real agent (real tools) on a few test perturbations.
+
+    Each perturbation gets one question; the orchestrator calls the actual
+    prediction-head, retrieval, enrichment and literature tools.  The same
+    :mod:`perturbgpt.eval.agent_eval` metrics used for the mock probes are
+    then computed from the real transcripts.
+
+    Returns
+    -------
+    dict[str, float]
+        Empty when the stage cannot run (no perturbations / missing
+        credentials), otherwise ``grounding_rate``,
+        ``citation_validity_rate``, ``no_evidence_fallback_rate``,
+        ``tool_success_rate``, ``n_perturbations`` and ``n_tool_calls``.
+    """
+    try:
+        llm_fn = make_llm_fn(provider=llm_provider, model=llm_model)
+    except (RuntimeError, ValueError) as exc:
+        print(f"  Skipping full-agent stage: {exc}")
+        return {}
+
+    perts = _test_perturbations(n_perts)
+    if not perts:
+        print("  Skipping full-agent stage: no test perturbations found "
+              "(run the training/retrieval stages first).")
+        return {}
+
+    if not agent_tools.DEFAULT_CHECKPOINT.exists():
+        print(f"  WARNING: {agent_tools.DEFAULT_CHECKPOINT} is missing; "
+              "get_predicted_genes will report no evidence.")
+
+    print(f"  Running the agent on {len(perts)} perturbation(s): "
+          f"{', '.join(perts)} (llm={llm_provider})")
+
+    grounding: list[float] = []
+    validity: list[bool] = []
+    fallback: list[bool] = []
+    tool_success: list[float] = []
+
+    for pert in perts:
+        response = run(
+            f"What are the downstream effects of {pert} perturbation?",
+            llm_fn,
+            perturbation_id=pert,
+            tools=TOOLS,
+        )
+        grounding.append(agent_eval.grounding_rate(response.answer, response.evidence))
+        validity.append(
+            not agent_eval.check_citation_validity(response.answer, response.evidence)
+        )
+        fallback.append(
+            agent_eval.check_no_evidence_fallback(response.answer, response.evidence)
+        )
+        print(f"    {pert}: {len(response.evidence)} tool call(s), "
+              f"grounding={grounding[-1]:.2f}")
+        for record in response.evidence:
+            ok = isinstance(record.result, list) and len(record.result) > 0
+            tool_success.append(1.0 if ok else 0.0)
+
+    n = len(perts)
+    return {
+        "grounding_rate": sum(grounding) / n,
+        "citation_validity_rate": sum(validity) / n,
+        "no_evidence_fallback_rate": sum(fallback) / n,
+        "tool_success_rate": (
+            sum(tool_success) / len(tool_success) if tool_success else 0.0
+        ),
+        "n_perturbations": float(n),
+        "n_tool_calls": float(len(tool_success)),
+    }
+
+
 # ------------------------------------------------------------- table printing
 
 
@@ -306,8 +404,21 @@ def print_ablation_table(
     # --- Level 4: agent metrics ----------------------------------------------
     if agent_metrics:
         print("\n  ── Agent-level metrics (full agent) ──")
-        for key, val in agent_metrics.items():
-            print(f"    {key:<34s} {val:>12.6f}")
+        for group, group_metrics in agent_metrics.items():
+            if not isinstance(group_metrics, dict):
+                group_metrics = {group: group_metrics}
+                group = "metrics"
+            print(f"\n    [{group}]")
+            for key, val in group_metrics.items():
+                if isinstance(val, bool):
+                    shown = str(val)
+                elif isinstance(val, int):
+                    shown = f"{val:d}"
+                elif isinstance(val, float):
+                    shown = f"{val:.6f}"
+                else:
+                    shown = str(val)
+                print(f"    {key:<34s} {shown:>12s}")
 
     print("\n" + bar + "\n")
 
@@ -362,7 +473,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--run-baseline",
         action="store_true",
-        help="Re-run the PCA+MLP baseline training.",
+        help="Re-run the perturbation-embedding MLP baseline training.",
     )
     parser.add_argument(
         "--run-film-head",
@@ -378,6 +489,34 @@ def main(argv=None) -> int:
         "--skip-agent-eval",
         action="store_true",
         help="Skip the scripted agent-eval probes.",
+    )
+    parser.add_argument(
+        "--full-agent",
+        action="store_true",
+        help="Execute the real tool-calling agent on a few test perturbations "
+             "and report agent-eval metrics.",
+    )
+    parser.add_argument(
+        "--agent-perts",
+        type=int,
+        default=3,
+        help="Number of test perturbations for --full-agent (default: 3).",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        default="deterministic",
+        choices=("deterministic", "openai", "anthropic", "ollama"),
+        help="LLM backend for --full-agent (default: deterministic, no key).",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Model name for the chosen LLM backend.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=str(PROJECT_ROOT / "runs" / "film_head.pt"),
+        help="Prediction checkpoint used for the response-signature index.",
     )
     args = parser.parse_args(argv)
 
@@ -415,12 +554,15 @@ def main(argv=None) -> int:
             return rc
 
     if run_retrieval:
-        rc = run_stage("+retrieval (FAISS indices)", [
+        retrieval_cmd = [
             sys.executable, str(scripts_dir / "build_retrieval_index.py"),
             "--embeddings-dir", str(embeddings_dir),
             "--data", args.data,
             "--output-dir", str(indices_dir),
-        ])
+        ]
+        if Path(args.checkpoint).exists():
+            retrieval_cmd += ["--checkpoint", str(args.checkpoint)]
+        rc = run_stage("+retrieval (FAISS indices)", retrieval_cmd)
         if rc != 0:
             return rc
 
@@ -430,9 +572,19 @@ def main(argv=None) -> int:
     retrieval_metrics = load_retrieval_metrics(
         indices_dir / "retrieval_results.json"
     )
-    agent_metrics: dict[str, float] = {}
+    agent_metrics: dict[str, dict[str, float]] = {}
     if not args.skip_agent_eval:
-        agent_metrics = run_agent_eval_probes()
+        probes = run_agent_eval_probes()
+        if probes:
+            agent_metrics["probes"] = probes
+    if args.full_agent:
+        full_agent = run_full_agent_eval(
+            n_perts=args.agent_perts,
+            llm_provider=args.llm_provider,
+            llm_model=args.llm_model,
+        )
+        if full_agent:
+            agent_metrics["full_agent"] = full_agent
 
     # 3. Print consolidated table.
     print_ablation_table(prediction_metrics, retrieval_metrics, agent_metrics)

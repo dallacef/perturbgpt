@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")  # noqa: E402  — headless backend before pyplot import
 
 import matplotlib.pyplot as plt  # noqa: E402
@@ -192,9 +193,10 @@ def train_film_model(adata, split, raw_deltas, ctrl_sigma, gene_emb_map, d_model
     Targets are standardized for training; ``test_deltas`` stay raw.
     Returns ``(model, test_deltas)``.
     """
-    train_deltas = standardize_deltas(
-        {p: raw_deltas[p] for p in split.train_perts if p in raw_deltas}, ctrl_sigma,
-    )
+    # train_deltas = standardize_deltas(
+    #     {p: raw_deltas[p] for p in split.train_perts if p in raw_deltas}, ctrl_sigma,
+    # )
+    train_deltas = {p: raw_deltas[p] for p in split.train_perts if p in raw_deltas}
     test_deltas = {p: raw_deltas[p] for p in split.test_perts if p in raw_deltas}
 
     n_hvgs = adata.n_vars
@@ -234,6 +236,7 @@ def train_film_model(adata, split, raw_deltas, ctrl_sigma, gene_emb_map, d_model
             optimizer.zero_grad()
             mu, log_var = model(ctrl_batch, pert_batch)
             loss = gaussian_nll_loss(mu, log_var, target_batch)
+            print(f"Epoch {_+1}, target batch mean={target_batch.mean().item():.6f}, mu mean={mu.mean().item():.6f}")
             loss.backward()
             optimizer.step()
 
@@ -256,7 +259,8 @@ def film_predictions(model, ctrl_embs, test_deltas, gene_emb_map, d_model, ctrl_
             pert_batch = pert_feat[j].unsqueeze(0).expand(n_ctrl, -1)
             mu, _log_var = model(ctrl_batch, pert_batch)
             preds_list.append(mu.mean(dim=0).cpu().numpy())
-    preds = unstandardize_predictions(np.stack(preds_list), ctrl_sigma)
+    # preds = unstandardize_predictions(np.stack(preds_list), ctrl_sigma)
+    preds = np.stack(preds_list)
     return {p: (test_deltas[p], preds[i]) for i, p in enumerate(perts)}
 
 

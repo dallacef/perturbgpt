@@ -59,7 +59,6 @@ from perturbgpt.retrieval.metrics import (  # noqa: E402
     evaluate_retrieval,
     random_baseline_metrics,
 )
-from perturbgpt.eval.prediction_metrics import pearson_corr  # noqa: E402
 
 
 def load_gene_embeddings(embeddings_dir: Path) -> tuple[dict[str, np.ndarray], int]:
@@ -91,44 +90,22 @@ def load_predicted_response_vectors(
     gene_emb_map: dict[str, np.ndarray],
     pert_labels: list[str],
     device: str = "cpu",
-) -> np.ndarray:
-    """Load a trained gene-embedding MLP checkpoint and predict Δx̂ per perturbation.
+) -> np.ndarray | None:
+    """Predict Δx̂ per perturbation from a trained prediction-head checkpoint.
 
-    Falls back to None if the checkpoint is not available; the caller should
-    then use pseudobulk deltas.
+    Both FiLM and gene-MLP checkpoints are supported: the checkpoint tags
+    its architecture and
+    :func:`~perturbgpt.models.prediction_head.load_prediction_checkpoint`
+    dispatches on it.  Returns ``None`` when the checkpoint is absent, so
+    the caller can fall back to observed pseudobulk deltas.
     """
-    import torch
-    from perturbgpt.models.prediction_head import GeneMLP, compute_perturbation_embedding
+    from perturbgpt.models.prediction_head import load_prediction_checkpoint
 
     if not checkpoint_path.exists():
         return None
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = ckpt.get("model_config", {})
-    pert_emb_dim = cfg.get("pert_emb_dim", 512)
-    hidden_dim = cfg.get("hidden_dim", 256)
-    num_layers = cfg.get("num_layers", 2)
-    n_hvgs = cfg.get("n_hvgs")
-    dropout = cfg.get("dropout", 0.0)
-
-    model = GeneMLP(
-        pert_emb_dim=pert_emb_dim,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        n_hvgs=n_hvgs,
-        dropout=dropout,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-
-    d_model = pert_emb_dim
-    pert_feat = torch.tensor(
-        np.stack([compute_perturbation_embedding(p, gene_emb_map, d_model) for p in pert_labels]),
-        dtype=torch.float32, device=device,
-    )
-    with torch.no_grad():
-        preds = model(pert_feat).cpu().numpy()
-    return preds
+    bundle = load_prediction_checkpoint(checkpoint_path, device=device)
+    return bundle.predict_delta(pert_labels, gene_emb_map)
 
 
 def expression_correlation_ranking(
@@ -326,7 +303,9 @@ def main(argv=None) -> int:
             checkpoint_path, gene_emb_map, pert_labels,
         )
         if response_vectors is not None:
-            response_source = "predicted_gene_mlp"
+            from perturbgpt.models.prediction_head import read_checkpoint_arch
+
+            response_source = f"predicted_{read_checkpoint_arch(checkpoint_path)}"
             print(f"  Predicted {response_vectors.shape[0]} response vectors "
                   f"of dim {response_vectors.shape[1]}")
         else:
@@ -356,14 +335,20 @@ def main(argv=None) -> int:
     )
     print(f"  {response_index.n_entries} entries, dim={response_index.dim}")
 
-    # 6. Build ground truth (pathway co-membership — stub returns empty)
+    # 6. Build ground truth from pathway co-membership.
     print("\nBuilding pathway-co-membership ground truth ...")
     ground_truth = build_pathway_co_membership(pert_labels)
-    n_with_gt = sum(1 for v in ground_truth.values() if v)
+    gt_sizes = [len(v) for v in ground_truth.values()]
+    non_empty = [n for n in gt_sizes if n]
+    n_with_gt = len(non_empty)
     print(f"  {n_with_gt}/{len(ground_truth)} perturbations have non-empty ground truth")
-    if n_with_gt == 0:
-        print("  (Stub pathway lookup returns empty — all metrics will be 0.0. "
-              "Prompt 7 will implement real pathway memberships.)")
+    if non_empty:
+        print(f"  neighbours per perturbation: median={int(np.median(non_empty))}, "
+              f"max={max(non_empty)}")
+    else:
+        print("  WARNING: no pathway memberships found; recall/precision/MRR "
+              "will be 0.0.")
+        print("  Build the gene sets first: python scripts/build_pathway_sets.py")
 
     # 7. Evaluate all systems
     k_values = args.k_values

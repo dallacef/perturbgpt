@@ -1,1 +1,29 @@
-# Local orchestration for the API service (and, optionally, a separate literature-index/vector-store service).
+# Local orchestration for the API service.
+#
+# Artefacts (data/embeddings, data/indices, data/pathways, data/literature,
+# runs/film_head.pt) are produced by the scripts in scripts/ and mounted
+# read-only here — they are not baked into the image.
+services:
+  api:
+    build: .
+    image: perturbgpt-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      PERTURBGPT_LLM_PROVIDER: ${PERTURBGPT_LLM_PROVIDER:-deterministic}
+      PERTURBGPT_LLM_MODEL: ${PERTURBGPT_LLM_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/app/data:ro
+      - ./runs:/app/runs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped

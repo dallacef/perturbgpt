@@ -18,6 +18,7 @@ import torch
 from anndata import AnnData
 from scipy import sparse
 
+from perturbgpt.data.splitting import PerturbationSplit
 from perturbgpt.eval.prediction_metrics import (
     mae,
     mse,
@@ -34,7 +35,6 @@ from perturbgpt.models.baseline import (
     standardize_deltas,
     unstandardize_predictions,
 )
-from perturbgpt.data.splitting import CONTROL_LABEL, PerturbationSplit
 
 # ============================================================== model tests
 

@@ -5,25 +5,66 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "perturbgpt"
 version = "0.1.0"
-description = "PerturbGPT: perturbation-response modeling on Perturb-seq data"
+description = "Perturbation-response modelling on Perturb-seq data with scGPT embeddings, retrieval, and a tool-calling agent"
 readme = "README.md"
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     "anndata>=0.10",
+    "matplotlib>=3.8",
     "numpy>=1.26",
     "pandas>=2.0",
-    "scipy>=1.11",
     "pyyaml>=6.0",
     "requests>=2.31",
+    "scipy>=1.11",
+    "torch>=2.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
-wandb = ["wandb>=0.16"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
 retrieval = ["faiss-cpu>=1.7"]
+pathways = ["gseapy>=1.1"]
+literature = ["sentence-transformers>=2.6"]
+wandb = ["wandb>=0.16"]
+scgpt = ["scgpt>=0.2.4"]
+geneformer = ["transformers>=4.40", "huggingface-hub>=0.23"]
+all = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "faiss-cpu>=1.7",
+    "gseapy>=1.1",
+    "sentence-transformers>=2.6",
+    "wandb>=0.16",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "scripts", "tests"]
+# Notebooks are exploratory; ruff does not lint .ipynb cells.
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+# E/F/W catch real bugs (unused imports, undefined names, bare excepts);
+# I enforces import ordering.  E501 is left to the formatter so long
+# docstrings/comments do not fail CI.
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

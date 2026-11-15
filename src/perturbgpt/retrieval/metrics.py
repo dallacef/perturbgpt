@@ -5,35 +5,48 @@ Ground truth is defined by **pathway co-membership**: a perturbation's
 share at least one curated gene-set / pathway membership with the query
 perturbation's target gene(s).
 
-The pathway-membership lookup (``get_pathway_memberships``) is currently a
-**stub** that returns an empty mapping.  Prompt 7 will replace it with a
-real implementation backed by MSigDB / Reactome / KEGG.
+Pathway memberships come from the MSigDB Hallmark collection, written to
+``data/pathways/msigdb_hallmark.json`` by ``scripts/build_pathway_sets.py``
+and loaded through :func:`perturbgpt.eval.pathway_metrics.load_gene_sets`.
+When that file is absent the memberships degrade to an empty mapping, so
+retrieval metrics report 0.0 rather than crashing.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional, Sequence
 
 from perturbgpt.data.splitting import parse_perturbation
 
-
 # --------------------------------------------------------- ground-truth stub
 
 
-def get_pathway_memberships() -> dict[str, set[str]]:
+def get_pathway_memberships(
+    cache_path: Optional[Path] = None,
+) -> dict[str, set[str]]:
     """Return a mapping gene_symbol → set of pathway/gene-set names.
 
     Loads the MSigDB Hallmark gene sets via
     :func:`~perturbgpt.eval.pathway_metrics.load_gene_sets` and inverts
     the mapping (pathway → genes) into (gene → pathways).
 
-    If the gene-set file is not available (gseapy not installed, no local
-    cache), returns an empty dict so downstream code degrades gracefully
-    rather than crashing.
+    Parameters
+    ----------
+    cache_path : Path, optional
+        Explicit gene-set JSON file.  Defaults to
+        ``data/pathways/msigdb_hallmark.json`` (see
+        ``scripts/build_pathway_sets.py``).
+
+    Returns
+    -------
+    dict[str, set[str]]
+        Empty when the gene-set file is unavailable (not built yet, no
+        gseapy install) so downstream code degrades gracefully.
     """
     try:
         from perturbgpt.eval.pathway_metrics import load_gene_sets
-        gene_sets = load_gene_sets()
+        gene_sets = load_gene_sets(cache_path=cache_path)
     except (ImportError, FileNotFoundError, OSError):
         return {}
 
@@ -63,7 +76,7 @@ def build_pathway_co_membership(
         Perturbation labels in the index.
     pathway_memberships : dict[str, set[str]], optional
         Gene symbol → pathway names.  Defaults to
-        :func:`get_pathway_memberships` (the stub).
+        :func:`get_pathway_memberships` (MSigDB Hallmark).
 
     Returns
     -------

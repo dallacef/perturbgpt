@@ -14,7 +14,6 @@ from typing import Sequence
 
 from perturbgpt.agent.orchestrator import ToolCall
 from perturbgpt.agent.prompts import (
-    CITATION_REGEX,
     extract_citations,
     has_no_evidence_phrase,
 )

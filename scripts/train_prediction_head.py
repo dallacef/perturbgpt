@@ -15,7 +15,11 @@ The split is **identical** to the one used by ``scripts/train_baseline.py``
 with predictions averaged over all control cells for each perturbation.
 Results are appended to the same ``results/metrics.csv`` so the two models are
 directly comparable. A markdown comparison table (baseline vs. FiLM head) is
-printed at the end.
+printed at the end.  The trained head is also serialized to an
+inference-ready checkpoint (default ``runs/film_head.pt``) holding
+``{arch, model_config, model_state_dict, gene_names, control_emb_mean}``,
+which is what :mod:`perturbgpt.agent.tools` and
+``scripts/build_retrieval_index.py`` load.
 
 Usage
 -----
@@ -51,8 +55,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from perturbgpt.data.splitting import (  # noqa: E402
     CONTROL_LABEL,
-    perturbation_split,
     persist_split,
+    perturbation_split,
 )
 from perturbgpt.eval.prediction_metrics import (  # noqa: E402
     mae,
@@ -61,15 +65,11 @@ from perturbgpt.eval.prediction_metrics import (  # noqa: E402
     spearman_corr,
     top_k_recovery,
 )
-from perturbgpt.models.baseline import (  # noqa: E402
-    compute_control_statistics,
-    compute_pseudobulk_deltas,
-    standardize_deltas,
-    unstandardize_predictions,
-)
+from perturbgpt.models.baseline import compute_pseudobulk_deltas  # noqa: E402
 from perturbgpt.models.prediction_head import (  # noqa: E402
     FiLMPredictionHead,
     compute_perturbation_embedding,
+    save_prediction_checkpoint,
 )
 
 MODEL_NAME = "film_head"
@@ -146,7 +146,7 @@ class ControlPertDataset(Dataset):
     """Cartesian product of control-cell embeddings and perturbations.
 
     Each ``(control_cell_i, perturbation_j)`` pair is one training sample whose
-    target is perturbation ``j``'s standardized pseudobulk delta (broadcast over
+    target is perturbation ``j``'s pseudobulk delta (broadcast over
     all control cells). ``__len__`` is ``n_ctrl * n_pert``.
     """
 
@@ -226,7 +226,6 @@ def evaluate(
     deltas: dict[str, np.ndarray],
     gene_emb_map: dict[str, np.ndarray],
     d_model: int,
-    sigma: np.ndarray,
     device: torch.device,
     top_k: int,
 ) -> dict[str, float]:
@@ -235,9 +234,8 @@ def evaluate(
     For each perturbation, the model is run on every control-cell embedding
     paired with that perturbation's gene embedding, and the ``mu`` predictions
     are averaged over control cells to give a single perturbation-level
-    prediction. Predictions and targets are un-standardized (multiplied by
-    ``sigma``) before metrics are computed so every metric is reported in the
-    original delta scale.
+    prediction. Targets are on the raw delta scale (no standardization), so
+    predictions and targets are directly comparable.
     """
     model.eval()
     perts = sorted(deltas.keys())
@@ -261,8 +259,8 @@ def evaluate(
             mu, _log_var = model(ctrl_batch, pert_batch)
             mu_preds.append(mu.mean(dim=0).cpu().numpy())
 
-    preds = unstandardize_predictions(np.stack(mu_preds), sigma)
-    trues = unstandardize_predictions(np.stack([deltas[p] for p in perts]), sigma)
+    preds = np.stack(mu_preds)
+    trues = np.stack([deltas[p] for p in perts])
     tk = top_k_recovery(preds, trues, k=top_k)
     return {
         "pearson": pearson_corr(preds, trues),
@@ -397,6 +395,17 @@ def main(argv=None) -> int:
     parser.add_argument("--use-wandb", action="store_true", help="enable W&B tracking")
     parser.add_argument("--wandb-project", default=None, help="W&B project name")
     parser.add_argument("--wandb-run-name", default=None, help="W&B run name")
+    parser.add_argument(
+        "--checkpoint-out",
+        default=str(PROJECT_ROOT / "runs" / "film_head.pt"),
+        help="Where to write the inference-ready checkpoint "
+             "(default: runs/film_head.pt).",
+    )
+    parser.add_argument(
+        "--no-save-checkpoint",
+        action="store_true",
+        help="Skip writing the inference checkpoint.",
+    )
     args, unknown = parser.parse_known_args(argv)
 
     model_cfg = load_config(Path(args.model_config))["prediction_head"]
@@ -511,11 +520,9 @@ def main(argv=None) -> int:
     test_deltas = {p: d for p, d in all_deltas.items() if p in split.test_perts}
     print(f"Deltas: train={len(train_deltas)} val={len(val_deltas)} test={len(test_deltas)}")
 
-    # Per-gene control statistics for target standardization.
-    ctrl_mu, ctrl_sigma = compute_control_statistics(adata, split)
-    train_deltas = standardize_deltas(train_deltas, ctrl_sigma)
-    val_deltas = standardize_deltas(val_deltas, ctrl_sigma)
-    test_deltas = standardize_deltas(test_deltas, ctrl_sigma)
+    # Targets stay on the raw delta scale: the Gaussian NLL is fit directly to
+    # the observed pseudobulk deltas, so every reported metric is already in
+    # the original delta scale (no per-gene standardization).
 
     # 5. Build model
     n_hvgs = adata.n_vars
@@ -582,7 +589,6 @@ def main(argv=None) -> int:
             mu, log_var = model(ctrl_batch, pert_batch)
             loss = gaussian_nll_loss(mu, log_var, target_batch)
             # print(f"Epoch {epoch+1}")
-            # print(f"pert_batch={pert_batch[0]}")
             # print(f"mu={mu[0].mean().item():.6f}, log_var={log_var[0].mean().item():.6f}, target={target_batch[0].mean().item():.6f}")
             loss.backward()
             optimizer.step()
@@ -603,7 +609,7 @@ def main(argv=None) -> int:
         # Full val metrics every full_val_interval
         if val_pert_emb.shape[0] and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
             val_metrics = evaluate(
-                model, ctrl_embs, val_deltas, gene_emb_map, d_model, ctrl_sigma, device, top_k,
+                model, ctrl_embs, val_deltas, gene_emb_map, d_model, device, top_k,
             )
             if use_wandb:
                 wandb.log({f"val/{k}": v for k, v in val_metrics.items()})
@@ -627,7 +633,9 @@ def main(argv=None) -> int:
         if not deltas:
             print(f"No perturbations in {split_name} split, skipping.")
             continue
-        metrics = evaluate(model, ctrl_embs, deltas, gene_emb_map, d_model, ctrl_sigma, device, top_k)
+        metrics = evaluate(
+            model, ctrl_embs, deltas, gene_emb_map, d_model, device, top_k,
+        )
         print(f"\n=== {split_name} metrics ===")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
@@ -640,7 +648,29 @@ def main(argv=None) -> int:
 
     print(f"\nResults appended to {results_path}")
 
-    # 9. Print comparison table
+    # 9. Persist an inference-ready checkpoint for the agent tools and the
+    # retrieval-index builder (both load it via
+    # ``perturbgpt.models.prediction_head.load_prediction_checkpoint``).
+    if not args.no_save_checkpoint:
+        ckpt_path = save_prediction_checkpoint(
+            Path(args.checkpoint_out),
+            model,
+            arch="film",
+            model_config={
+                "pert_emb_dim": int(pert_emb_dim),
+                "control_emb_dim": int(control_emb_dim),
+                "hidden_dim": int(model_cfg["hidden_dim"]),
+                "num_layers": int(model_cfg["num_layers"]),
+                "film_hidden_dim": model_cfg.get("film_hidden_dim"),
+                "dropout": 0.0,
+                "n_hvgs": int(n_hvgs),
+            },
+            gene_names=list(adata.var_names.astype(str)),
+            control_emb_mean=ctrl_embs.mean(dim=0).cpu().numpy(),
+        )
+        print(f"Saved inference checkpoint to {ckpt_path}")
+
+    # 10. Print comparison table
     print_comparison_table(results_path, final_metrics)
 
     if use_wandb:
