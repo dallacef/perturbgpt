@@ -10,6 +10,9 @@ from __future__ import annotations
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
+# starlette.testclient needs httpx (an optional test dependency, declared in the
+# ``dev`` extra).  Skip rather than error during collection if it is absent.
+pytest.importorskip("httpx", reason="starlette.testclient requires httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from perturbgpt.agent.orchestrator import AgentResponse, ToolCall  # noqa: E402
