@@ -58,6 +58,7 @@ from perturbgpt.models.baseline import (  # noqa: E402
 from perturbgpt.models.prediction_head import (  # noqa: E402
     FiLMPredictionHead,
     compute_perturbation_embedding,
+    gaussian_nll_loss,
 )
 
 
@@ -87,16 +88,6 @@ def load_cell_embeddings(embeddings_dir: Path) -> tuple[np.ndarray, list[str]]:
     cell_emb = npz["embeddings"]
     cell_ids = npz["cell_ids"].astype(str)
     return cell_emb, list(cell_ids)
-
-
-def gaussian_nll_loss(
-    mu: torch.Tensor,
-    log_var: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    """Gaussian NLL of ``target`` under N(mu, exp(log_var)) (constant dropped)."""
-    var = log_var.exp()
-    return 0.5 * (log_var + (target - mu).pow(2) / var).mean()
 
 
 class ControlPertDataset(Dataset):

@@ -240,7 +240,12 @@ class FiLMPredictionHead(nn.Module):
             h = self.dropout(h)
 
         mu = self.mu_head(h)
-        log_variance = self.logvar_head(h)
+        # The uncertainty head is auxiliary and unused at inference time
+        # (``predict_delta`` returns ``mu``).  It is trained on *detached* trunk
+        # features so its likelihood objective can never perturb the features
+        # ``mu`` depends on — otherwise the variance term destabilises the mean
+        # head (val MSE rose from 6.9 to 8.2 while train loss kept falling).
+        log_variance = self.logvar_head(h.detach())
         return mu, log_variance
 
 
@@ -249,6 +254,45 @@ class FiLMPredictionHead(nn.Module):
 
 # --------------------------------------------------------- helpers
 
+
+# Bounds on the predicted log-variance used by :func:`gaussian_nll_loss`.
+# Without a floor, the NLL chases zero variance (log_var -> -inf) as soon as a
+# single gene is badly under-predicted; ``exp(log_var)`` in the denominator then
+# makes the loss explode and training stalls.  Observed on the Norman split:
+# val NLL went -0.58 -> 0.12 -> 2.95 -> 196 -> ... -> 210,379 over 20 epochs.
+LOG_VAR_MIN = -10.0
+LOG_VAR_MAX = 10.0
+
+
+def gaussian_nll_loss(
+    mu: torch.Tensor,
+    log_var: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Gaussian negative log-likelihood of ``target`` under N(mu, exp(log_var)).
+
+    The constant ``0.5 * log(2 * pi)`` term is dropped because it does not
+    affect the gradient.  ``log_var`` is clamped to
+    ``[LOG_VAR_MIN, LOG_VAR_MAX]`` to keep the loss finite; the returned value
+    is the mean over all elements, so it is comparable across batch sizes.
+
+    Parameters
+    ----------
+    mu : torch.Tensor
+        Predicted mean, shape ``[..., n_genes]``.
+    log_var : torch.Tensor
+        Predicted log-variance, same shape as ``mu``.
+    target : torch.Tensor
+        Observed value, broadcastable to ``mu``.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss.
+    """
+    log_var = torch.clamp(log_var, min=LOG_VAR_MIN, max=LOG_VAR_MAX)
+    var = log_var.exp()
+    return 0.5 * (log_var + (target - mu).pow(2) / var).mean()
 
 
 def compute_perturbation_embedding(

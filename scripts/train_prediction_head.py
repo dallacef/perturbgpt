@@ -5,9 +5,11 @@ Loads cached scGPT gene and cell embeddings (from
 ``scripts/build_embeddings.py``), pairs every control cell embedding with each
 perturbation's summed gene embedding, and trains a FiLM-conditioned head to
 predict the pseudobulk expression delta Δx over the HVG gene set. The model
-outputs a mean ``mu`` and a ``log_variance`` per HVG, and is trained by
-maximizing the likelihood of the true Δx under the predicted normal
-distribution (a Gaussian negative log-likelihood loss).
+outputs a mean ``mu`` and a ``log_variance`` per HVG.  ``mu`` is trained with
+MSE; the variance head is trained with a Gaussian negative log-likelihood on a
+*detached* residual (clamped ``log_var``), so the two heads cannot trade off
+against each other.  Early stopping monitors validation MSE and the
+best-validation weights are restored before evaluation and serialization.
 
 The split is **identical** to the one used by ``scripts/train_baseline.py``
 (same seed, same perturbation-level partition), and evaluation uses the **same**
@@ -33,6 +35,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import sys
 from datetime import datetime, timezone
@@ -69,6 +72,7 @@ from perturbgpt.models.baseline import compute_pseudobulk_deltas  # noqa: E402
 from perturbgpt.models.prediction_head import (  # noqa: E402
     FiLMPredictionHead,
     compute_perturbation_embedding,
+    gaussian_nll_loss,
     save_prediction_checkpoint,
 )
 
@@ -127,21 +131,6 @@ def load_cell_embeddings(embeddings_dir: Path) -> tuple[np.ndarray, list[str]]:
     return cell_emb, list(cell_ids)
 
 
-def gaussian_nll_loss(
-    mu: torch.Tensor,
-    log_var: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    """Gaussian negative log-likelihood of ``target`` under N(mu, exp(log_var)).
-
-    The constant ``0.5 * log(2 * pi)`` term is dropped because it does not
-    affect the gradient. ``log_var`` is the per-gene log-variance predicted by
-    the model.
-    """
-    var = log_var.exp()
-    return 0.5 * (log_var + (target - mu).pow(2) / var).mean()
-
-
 class ControlPertDataset(Dataset):
     """Cartesian product of control-cell embeddings and perturbations.
 
@@ -188,6 +177,28 @@ def compute_split_loss(
             target_batch = targets[j].unsqueeze(0).expand(n_ctrl, -1)
             mu, log_var = model(ctrl_batch, pert_batch)
             total += float(gaussian_nll_loss(mu, log_var, target_batch)) * n_ctrl
+            n_pairs += n_ctrl
+    return total / n_pairs if n_pairs else float("inf")
+
+
+def compute_split_mse(
+    model: FiLMPredictionHead,
+    ctrl_embs: torch.Tensor,
+    pert_embs: torch.Tensor,
+    targets: torch.Tensor,
+) -> float:
+    """Mean squared error of ``mu`` over all (control cell, perturbation) pairs."""
+    model.eval()
+    n_ctrl = int(ctrl_embs.shape[0])
+    total = 0.0
+    n_pairs = 0
+    with torch.no_grad():
+        for j in range(int(pert_embs.shape[0])):
+            ctrl_batch = ctrl_embs
+            pert_batch = pert_embs[j].unsqueeze(0).expand(n_ctrl, -1)
+            target_batch = targets[j].unsqueeze(0).expand(n_ctrl, -1)
+            mu, _log_var = model(ctrl_batch, pert_batch)
+            total += float(torch.nn.functional.mse_loss(mu, target_batch)) * n_ctrl
             n_pairs += n_ctrl
     return total / n_pairs if n_pairs else float("inf")
 
@@ -577,7 +588,8 @@ def main(argv=None) -> int:
     log_interval = wandb_cfg.get("log_interval", 1)
     full_val_interval = wandb_cfg.get("full_val_interval", 5)
 
-    best_val_loss = float("inf")
+    best_val_mse = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
     patience_counter = 0
 
     for epoch in range(epochs):
@@ -587,7 +599,15 @@ def main(argv=None) -> int:
         for ctrl_batch, pert_batch, target_batch in train_loader:
             optimizer.zero_grad()
             mu, log_var = model(ctrl_batch, pert_batch)
-            loss = gaussian_nll_loss(mu, log_var, target_batch)
+            # Decoupled objective.  ``mu`` is trained with MSE — the quantity
+            # the reported metrics score, and a far less noisy signal than the
+            # joint NLL.  The variance head learns from a *detached* residual,
+            # so it cannot trade off against ``mu``.  Training both jointly
+            # under one NLL made the val loss oscillate between 0.9 and 5.3
+            # epoch-to-epoch and stopped ``mu`` from improving.
+            loss = torch.nn.functional.mse_loss(mu, target_batch) + gaussian_nll_loss(
+                mu.detach(), log_var, target_batch
+            )
             # print(f"Epoch {epoch+1}")
             # print(f"mu={mu[0].mean().item():.6f}, log_var={log_var[0].mean().item():.6f}, target={target_batch[0].mean().item():.6f}")
             loss.backward()
@@ -596,15 +616,28 @@ def main(argv=None) -> int:
             n_batches += 1
         train_loss = epoch_loss / n_batches if n_batches else 0.0
 
-        # Evaluate val loss every epoch (mean NLL over all control-cell pairs)
+        # Evaluate val loss (NLL, for reporting) and val MSE (for early
+        # stopping, since that is what the reported metrics score).
         val_loss = float("inf")
+        val_mse = float("inf")
         if val_pert_emb.shape[0]:
             val_loss = compute_split_loss(model, ctrl_embs, val_pert_emb, val_targets)
+            val_mse = compute_split_mse(model, ctrl_embs, val_pert_emb, val_targets)
 
         if (epoch + 1) % log_interval == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}/{epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}")
+            print(
+                f"Epoch {epoch+1:3d}/{epochs}  train_loss={train_loss:.6f}  "
+                f"val_mse={val_mse:.6f}  val_nll={val_loss:.6f}"
+            )
             if use_wandb:
-                wandb.log({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
+                wandb.log(
+                    {
+                        "epoch": epoch + 1,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "val_mse": val_mse,
+                    }
+                )
 
         # Full val metrics every full_val_interval
         if val_pert_emb.shape[0] and ((epoch + 1) % full_val_interval == 0 or epoch == 0):
@@ -615,16 +648,25 @@ def main(argv=None) -> int:
                 wandb.log({f"val/{k}": v for k, v in val_metrics.items()})
                 wandb.log({"epoch": epoch + 1})
 
-        # Early stopping
-        if model_cfg.get("early_stopping", True) and val_loss < float("inf"):
-            if val_loss < best_val_loss - 1e-6:
-                best_val_loss = val_loss
+        # Early stopping on val MSE (the reported quantity).
+        if model_cfg.get("early_stopping", True) and val_mse < float("inf"):
+            if val_mse < best_val_mse - 1e-6:
+                best_val_mse = val_mse
                 patience_counter = 0
+                best_state = copy.deepcopy(model.state_dict())
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
                     print(f"Early stopping at epoch {epoch+1}")
                     break
+
+    # Restore the best-validation weights.  Without this the (possibly
+    # diverged) final epoch is what gets evaluated and written into the
+    # inference checkpoint, even though early stopping reported an earlier
+    # epoch as best.
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"Restored best weights (val_mse={best_val_mse:.6f})")
 
     # 8. Evaluate on val and test
     results_path = Path(args.results)
